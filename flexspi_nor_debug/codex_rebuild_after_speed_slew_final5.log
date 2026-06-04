@@ -1,0 +1,9 @@
+*** Using Compiler 'V6.24', folder: 'E:\Keil5\ARM\ARMCLANG\Bin'
+Build target 'freertos_hello flexspi_nor_debug'
+compiling freertos_hello.c...
+linking...
+flexspi_nor_debug\freertos_hello.out: error: L6047U: The size of this image (32772 bytes) exceeds the maximum allowed for this version of the linker
+Finished: 0 information, 0 warning, 0 error and 1 fatal error messages.
+"flexspi_nor_debug\freertos_hello.out" - 1 Error(s), 0 Warning(s).
+Target not created.
+Build Time Elapsed:  00:00:00

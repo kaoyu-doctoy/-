@@ -1,0 +1,8 @@
+*** Using Compiler 'V6.24', folder: 'E:\Keil5\ARM\ARMCLANG\Bin'
+Build target 'freertos_hello flexspi_nor_debug'
+compiling freertos_hello.c...
+linking...
+Program Size: Code=29720 RO-data=2744 RW-data=52 ZI-data=799380  
+After Build - User command #1: fromelf.exe --output "flexspi_nor_debug\freertos_hello.bin" --bincombined "flexspi_nor_debug\freertos_hello.out"
+"flexspi_nor_debug\freertos_hello.out" - 0 Error(s), 0 Warning(s).
+Build Time Elapsed:  00:00:03
