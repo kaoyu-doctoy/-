@@ -1,0 +1,87 @@
+#ifndef APP_CONFIG_H
+#define APP_CONFIG_H
+
+/* 底盘轮子数量。 */
+#define APP_WHEEL_COUNT (4U)
+
+/* 各周期任务的运行间隔，单位 ms。 */
+#define APP_CONTROL_PERIOD_MS (20U)
+#define APP_STATUS_PERIOD_MS  (100U)
+#define APP_IMU_PERIOD_MS     (50U)
+#define APP_PATH_PERIOD_MS    (20U)
+
+/* 电机 PWM 基础配置。 */
+#define APP_PWM_FREQUENCY_HZ (1000UL)
+#define APP_PWM_DEFAULT_DUTY (0U)
+#define APP_PWM_DUTY_MAX     (1000L)
+
+/* 底盘几何、减速比、编码器线数和最大运动限制。 */
+#define APP_WHEEL_DIAMETER_M         (0.063f)
+#define APP_WHEEL_BASE_M             (0.198f)
+#define APP_TRACK_WIDTH_M            (0.175f)
+#define APP_MOTOR_GEAR_RATIO         (2.333f)
+#define APP_ENCODER_COUNTS_PER_REV   (1024.0f)
+#define APP_MAX_SPEED_MPS            (2.80f)
+#define APP_MAX_YAW_RATE_RADPS       (3.0f)
+#define APP_LEGACY_MAX_STEER_DEG     (37.0f)
+
+/* 四轮速度闭环 PID 默认参数和输出限幅。 */
+#define APP_PID_GAIN_DEN             (10000L)
+#define APP_PID_LF_KP_DEFAULT        (650L)
+#define APP_PID_LF_KI_DEFAULT        (0L)
+#define APP_PID_LF_KD_DEFAULT        (700L)
+//ok
+#define APP_PID_RF_KP_DEFAULT        (480L)
+#define APP_PID_RF_KI_DEFAULT        (0L)
+#define APP_PID_RF_KD_DEFAULT        (500L)
+//ok
+#define APP_PID_LB_KP_DEFAULT        (600L)
+#define APP_PID_LB_KI_DEFAULT        (0L)
+#define APP_PID_LB_KD_DEFAULT        (650L)
+//ok
+#define APP_PID_RB_KP_DEFAULT        (500L)
+#define APP_PID_RB_KI_DEFAULT        (0L)
+#define APP_PID_RB_KD_DEFAULT        (550L)
+//ok
+#define APP_PID_INTEGRAL_LIMIT       (40000L)
+#define APP_PID_OUTPUT_MIN           (-1000L)
+#define APP_PID_OUTPUT_MAX           (1000L)
+
+/* 速度闭环的前馈、滤波、斜坡和目标限幅参数。 */
+#define APP_SPEED_FEEDFORWARD_MAX_CPS      (180000L)
+#define APP_SPEED_MIN_ACTIVE_DUTY          (30U)
+#define APP_SPEED_FILTER_NEW_WEIGHT        (1L)
+#define APP_SPEED_FILTER_DEN               (8L)
+#define APP_SPEED_TARGET_RAMP_CPS_PER_TICK (1000L)
+#define APP_WHEEL_MAX_TARGET_CPS           (40000L)
+
+/* 调试串口协议和两个视觉串口的接收参数。 */
+#define APP_DEBUG_UART_FRAME_MAX_LEN (320U)
+#define APP_DEBUG_UART_FRAME_TIMEOUT_MS (1000U)
+#define APP_DEBUG_UART_STREAM_PERIOD_MS (50U)
+#define APP_VISION_UART_BAUDRATE (115200U)
+#define APP_VISION_UART_COUNT (2U)
+#define APP_VISION_UART_RX_BUF_SIZE (512U)
+#define APP_VISION_UART_POLL_PERIOD_MS (2U)
+#define APP_VISION_FRAME_MAX_LEN (320U)
+#define APP_VISION_YAW_TIMEOUT_MS (300U)
+
+/* 地图、格子路径和自动行驶参数。 */
+#define APP_MAP_MAX_WIDTH (16U)
+#define APP_MAP_MAX_HEIGHT (12U)
+#define APP_PATH_MAX_STEPS (APP_MAP_MAX_WIDTH * APP_MAP_MAX_HEIGHT)
+#define APP_PATH_CELL_SIZE_MM (200U)
+#define APP_PATH_DRIVE_SPEED_MPS (0.20f)
+#define APP_PATH_YAW_HOLD_KP_RADPS_PER_DEG (0.025f)
+#define APP_PATH_YAW_HOLD_MAX_RADPS (0.80f)
+#define APP_PATH_FINISH_TOLERANCE_COUNTS (8L)
+
+/* 软件 I2C 与 IMU 旧协议相关参数。 */
+#define APP_SOFT_I2C_DELAY_COUNT (1200U)
+#define APP_IMU_I2C_ADDR_7BIT (0x68U)
+#define APP_IMU_REG_PWR_MGMT0 (0x4EU)
+#define APP_IMU_REG_GYRO_DATA_X1 (0x25U)
+#define APP_IMU_CALIBRATION_SAMPLES (40U)
+#define APP_IMU_PRINT_PERIOD_MS (100U)
+
+#endif
