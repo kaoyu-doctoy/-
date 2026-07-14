@@ -29,6 +29,9 @@ uint16_t BSP_VisionUartAvailable(bsp_vision_port_t port);
 /* 从指定视觉串口缓冲区读取数据，返回实际读取字节数。 */
 uint16_t BSP_VisionUartRead(bsp_vision_port_t port, uint8_t *buffer, uint16_t maxLen);
 
+/* 通过指定视觉串口阻塞发送一段数据，成功返回 true。 */
+bool BSP_VisionUartWrite(bsp_vision_port_t port, const uint8_t *buffer, uint16_t length);
+
 /* 获取指定视觉串口因缓冲区满导致丢字节的累计次数。 */
 uint32_t BSP_VisionUartGetOverflowCount(bsp_vision_port_t port);
 

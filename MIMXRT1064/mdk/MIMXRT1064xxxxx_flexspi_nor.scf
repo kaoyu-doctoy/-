@@ -113,8 +113,13 @@ LR_m_text m_interrupts_start m_text_start+m_text_size-m_interrupts_start {   ; l
   RW_m_ram_text m_qacode_start m_qacode_size { ;
     * (CodeQuickAccess)
   }
-  RW_m_ncache m_data2_start EMPTY 0 {
-  }
-  RW_m_ncache_unused +0 EMPTY m_data2_size-ImageLength(RW_m_ncache) { ; Empty region added for MPU configuration
-  }
+  
+/* 路径规划专用RAM区域 */
+RW_m_ncache m_data2_start m_data2_size {
+    * (PathPlannerRam)
+}
+
+/* 自动保留路径规划工作区之外的剩余RAM */
+RW_m_ncache_unused +0 EMPTY m_data2_size-ImageLength(RW_m_ncache) {
+}
 }

@@ -23,6 +23,13 @@ uint32_t Vision_GetOverflowCount(bsp_vision_port_t port);
 /* 获取最近一次视觉角度，单位 0.01 度；数据超时或未收到时返回 false。 */
 bool Vision_GetYawCentiDeg(int16_t *yawCentiDeg);
 
+/* 向视觉串口一请求地图，并返回地图接收确认。 */
+bool Vision_RequestMap(uint16_t sequence);
+bool Vision_SendMapAck(uint16_t sequence, bool retry);
+
+/* 向视觉串口二发起识别，并返回识别结果确认。 */
+bool Vision_RequestRecognition(uint16_t sequence, uint16_t pointIndex);
+bool Vision_SendRecognitionAck(uint16_t sequence, const char *status);
 /* 解析指定视觉串口缓冲中的一批文本帧。 */
 bool Vision_ParseFrame(bsp_vision_port_t port);
 

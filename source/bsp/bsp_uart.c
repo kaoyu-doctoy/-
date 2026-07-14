@@ -159,6 +159,18 @@ uint16_t BSP_VisionUartRead(bsp_vision_port_t port, uint8_t *buffer, uint16_t ma
     return readCount;
 }
 
+/* 通过指定视觉串口阻塞发送一段数据。 */
+bool BSP_VisionUartWrite(bsp_vision_port_t port, const uint8_t *buffer, uint16_t length)
+{
+    if (!Vision_IsValidPort(port) || (buffer == 0) || (length == 0U))
+    {
+        return false;
+    }
+
+    return (LPUART_WriteBlocking(s_visionUartBase[port], buffer, (size_t)length) ==
+            kStatus_Success);
+}
+
 /* 返回指定视觉串口缓冲满时丢弃字节的累计次数。 */
 uint32_t BSP_VisionUartGetOverflowCount(bsp_vision_port_t port)
 {

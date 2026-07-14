@@ -323,6 +323,52 @@ static void Protocol_PrintPathStatus(void)
     PUTCHAR('\n');
 }
 
+static void Protocol_PrintMissionStatus(void)
+{
+    mission_status_t status;
+    int32_t values[8];
+
+    PathPlanner_GetMissionStatus(&status);
+    values[0] = (int32_t)status.state;
+    values[1] = (int32_t)status.currentPoint;
+    values[2] = (int32_t)status.pointCount;
+    values[3] = (int32_t)status.recognizedCount;
+    values[4] = (int32_t)status.requestSequence;
+    values[5] = (int32_t)status.retryCount;
+    values[6] = status.mapReady ? 1 : 0;
+    values[7] = status.poseReady ? 1 : 0;
+
+    PRINTF("mission:");
+    Protocol_PrintInt32List(values, 8U);
+    PUTCHAR('\n');
+}
+
+static void Protocol_PrintRecognitionResults(void)
+{
+    mission_status_t status;
+    recognition_point_t point;
+    uint16_t index;
+
+    PathPlanner_GetMissionStatus(&status);
+    PRINTF("objects:%u,%u\n", (unsigned int)status.recognizedCount,
+           (unsigned int)status.pointCount);
+    for (index = 0U; index < status.pointCount; index++)
+    {
+        if (!PathPlanner_GetRecognitionPoint(index, &point))
+        {
+            continue;
+        }
+        PRINTF("object:%u,%u,%u,%u,%u,%u,%u,%u\n",
+               (unsigned int)index,
+               (unsigned int)point.objectX,
+               (unsigned int)point.objectY,
+               (unsigned int)point.observeX,
+               (unsigned int)point.observeY,
+               (unsigned int)point.observeDir,
+               (unsigned int)point.resultCode,
+               point.recognized ? 1U : 0U);
+    }
+}
 static void Protocol_StartStream(protocol_stream_t mode)
 {
     s_streamMode = mode;
@@ -485,6 +531,46 @@ void Protocol_ProcessFrame(const char *frame)
         return;
     }
 
+    if ((length >= 7U) && (frame[0] == 'M') && (frame[1] == 'I') && (frame[2] == 'S') &&
+        (frame[3] == 'S') && (frame[4] == 'I') && (frame[5] == 'O') && (frame[6] == 'N'))
+    {
+        if ((length == 7U) || ((length > 8U) && (frame[7] == ',') &&
+            Protocol_FrameTailEquals(frame, length, 8U, "STATUS")))
+        {
+            Protocol_PrintMissionStatus();
+        }
+        else if ((frame[7] == ',') && Protocol_FrameTailEquals(frame, length, 8U, "START"))
+        {
+            if (!PathPlanner_MissionStart())
+            {
+                PRINTF("error:mission_start\n");
+            }
+            Protocol_PrintMissionStatus();
+        }
+        else if ((frame[7] == ',') && Protocol_FrameTailEquals(frame, length, 8U, "STOP"))
+        {
+            PathPlanner_MissionStop();
+            Protocol_PrintMissionStatus();
+        }
+        else if ((frame[7] == ',') && Protocol_FrameTailEquals(frame, length, 8U, "RESET"))
+        {
+            PathPlanner_MissionReset();
+            Protocol_PrintMissionStatus();
+        }
+        else
+        {
+            PRINTF("error:mission_command\n");
+        }
+        return;
+    }
+
+    if ((length == 13U) && (frame[0] == 'R') && (frame[1] == 'E') && (frame[2] == 'C') &&
+        (frame[3] == 'O') && (frame[4] == 'G') && (frame[5] == ',') &&
+        Protocol_FrameTailEquals(frame, length, 6U, "RESULTS"))
+    {
+        Protocol_PrintRecognitionResults();
+        return;
+    }
     if ((length >= 4U) && (frame[0] == 'M') && (frame[1] == 'A') && (frame[2] == 'P') &&
         (frame[3] == ','))
     {

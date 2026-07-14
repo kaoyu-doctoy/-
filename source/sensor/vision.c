@@ -5,6 +5,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include <stdio.h>
+
 static char s_lineBuffer[BSP_VISION_PORT_COUNT][APP_VISION_FRAME_MAX_LEN];
 static uint16_t s_lineLength[BSP_VISION_PORT_COUNT];
 static int16_t s_yawCentiDeg;
@@ -209,12 +211,17 @@ static bool Vision_HandleYawLine(const char *line)
     return true;
 }
 
-/* 解析 map:w,h,rows 或 map:w,h:rows 格式。 */
+/* 解析带请求序号的 map:seq,w,h,rows，同时兼容旧的 map:w,h,rows。 */
 static bool Vision_HandleMapLine(const char *line)
 {
     const char *text;
+    uint16_t firstValue;
+    uint16_t secondValue;
+    uint16_t thirdValue;
+    uint16_t sequence = 0U;
     uint16_t width;
     uint16_t height;
+    bool mapOk;
 
     if (Vision_MatchPrefix(line, "map:"))
     {
@@ -229,21 +236,45 @@ static bool Vision_HandleMapLine(const char *line)
         return false;
     }
 
-    if (!Vision_ParseUint(&text, &width) || ((*text != ',') && (*text != ':')))
+    if (!Vision_ParseUint(&text, &firstValue) || (*text != ','))
     {
-        return false;
+        (void)Vision_SendMapAck(0U, true);
+        return true;
+    }
+    text++;
+    if (!Vision_ParseUint(&text, &secondValue) || ((*text != ',') && (*text != ':')))
+    {
+        (void)Vision_SendMapAck(0U, true);
+        return true;
     }
     text++;
 
-    if (!Vision_ParseUint(&text, &height) || ((*text != ',') && (*text != ':')))
+    if (Vision_IsDigit(*text))
     {
-        return false;
+        if (!Vision_ParseUint(&text, &thirdValue) || ((*text != ',') && (*text != ':')))
+        {
+            (void)Vision_SendMapAck(firstValue, true);
+            return true;
+        }
+        text++;
+        sequence = firstValue;
+        width = secondValue;
+        height = thirdValue;
     }
-    text++;
+    else
+    {
+        width = firstValue;
+        height = secondValue;
+    }
 
-    return PathPlanner_SetMapRows((uint8_t)width, (uint8_t)height, text);
+    mapOk = PathPlanner_SetMapRows((uint8_t)width, (uint8_t)height, text);
+    (void)Vision_SendMapAck(sequence, !mapOk);
+    if (mapOk)
+    {
+        PathPlanner_MissionOnMapReceived(sequence);
+    }
+    return true;
 }
-
 /* 解析 pose:x,y,heading，用于告诉 MCU 当前车在哪个格子。 */
 static bool Vision_HandlePoseLine(const char *line)
 {
@@ -352,14 +383,82 @@ static bool Vision_HandleCellLine(const char *line)
     return true;
 }
 
+/* 解析 result:seq,code；也兼容视觉端只发送0～20的裸数字。 */
+static bool Vision_HandleRecognitionLine(const char *line)
+{
+    const char *text = line;
+    uint16_t sequence = 0U;
+    uint16_t code;
+    bool accepted;
+    mission_status_t missionStatus;
+
+    if (Vision_MatchPrefix(line, "result:"))
+    {
+        text = line + 7;
+        if (!Vision_ParseUint(&text, &sequence) || (*text != ','))
+        {
+            return true;
+        }
+        text++;
+    }
+    else if (Vision_MatchPrefix(line, "result,"))
+    {
+        text = line + 7;
+        if (!Vision_ParseUint(&text, &sequence) || (*text != ','))
+        {
+            return true;
+        }
+        text++;
+    }
+    else if (!Vision_IsDigit(*line))
+    {
+        return false;
+    }
+
+    if (!Vision_ParseUint(&text, &code) || (*text != '\0') || (code > 20U))
+    {
+        return true;
+    }
+
+    accepted = PathPlanner_MissionOnRecognitionResult(sequence, (uint8_t)code);
+    if (!accepted)
+    {
+        (void)Vision_SendRecognitionAck(sequence, "ignored");
+    }
+    else
+    {
+        PathPlanner_GetMissionStatus(&missionStatus);
+        (void)Vision_SendRecognitionAck(sequence,
+                (missionStatus.state == MISSION_STATE_RETRY_RECOGNITION) ? "retry" : "ok");
+    }
+    return true;
+}
 /* 根据端口分发一行视觉文本。 */
 static bool Vision_HandleLine(bsp_vision_port_t port, const char *line)
 {
     if (port == BSP_VISION_PORT_1)
     {
-        return Vision_HandleYawLine(line);
+        if (Vision_HandleMapLine(line))
+        {
+            return true;
+        }
+        if (Vision_HandleYawLine(line))
+        {
+            return true;
+        }
+        if (Vision_HandlePoseLine(line))
+        {
+            return true;
+        }
+        return Vision_HandleCellLine(line);
     }
 
+    if (Vision_HandleRecognitionLine(line))
+    {
+        return true;
+    }
+
+    /* 保留旧视觉协议，方便已有模块继续发送这些命令。 */
     if (Vision_HandleMapLine(line))
     {
         return true;
@@ -372,14 +471,8 @@ static bool Vision_HandleLine(bsp_vision_port_t port, const char *line)
     {
         return true;
     }
-    if (Vision_HandleCellLine(line))
-    {
-        return true;
-    }
-
-    return false;
+    return Vision_HandleCellLine(line);
 }
-
 /* 初始化视觉模块的软件解析状态。 */
 void Vision_Init(void)
 {
@@ -443,6 +536,71 @@ bool Vision_GetYawCentiDeg(int16_t *yawCentiDeg)
     return true;
 }
 
+/* 发送一段以NUL结尾的视觉协议文本。 */
+static bool Vision_SendText(bsp_vision_port_t port, const char *text)
+{
+    uint16_t length = 0U;
+
+    if (text == 0)
+    {
+        return false;
+    }
+    while ((length < APP_VISION_TX_FRAME_MAX_LEN) && (text[length] != '\0'))
+    {
+        length++;
+    }
+    if ((length == 0U) || (length >= APP_VISION_TX_FRAME_MAX_LEN))
+    {
+        return false;
+    }
+    return BSP_VisionUartWrite(port, (const uint8_t *)text, length);
+}
+
+bool Vision_RequestMap(uint16_t sequence)
+{
+    char frame[APP_VISION_TX_FRAME_MAX_LEN];
+    int length;
+
+    length = snprintf(frame, sizeof(frame), "map_req:%u\n", (unsigned int)sequence);
+    return ((length > 0) && ((uint32_t)length < sizeof(frame)) &&
+            Vision_SendText(BSP_VISION_PORT_1, frame));
+}
+
+bool Vision_SendMapAck(uint16_t sequence, bool retry)
+{
+    char frame[APP_VISION_TX_FRAME_MAX_LEN];
+    int length;
+
+    length = snprintf(frame, sizeof(frame), "map_ack:%u,%s\n", (unsigned int)sequence,
+                      retry ? "retry" : "ok");
+    return ((length > 0) && ((uint32_t)length < sizeof(frame)) &&
+            Vision_SendText(BSP_VISION_PORT_1, frame));
+}
+
+bool Vision_RequestRecognition(uint16_t sequence, uint16_t pointIndex)
+{
+    char frame[APP_VISION_TX_FRAME_MAX_LEN];
+    int length;
+
+    length = snprintf(frame, sizeof(frame), "recognize:%u,%u\n", (unsigned int)sequence,
+                      (unsigned int)pointIndex);
+    return ((length > 0) && ((uint32_t)length < sizeof(frame)) &&
+            Vision_SendText(BSP_VISION_PORT_2, frame));
+}
+
+bool Vision_SendRecognitionAck(uint16_t sequence, const char *status)
+{
+    char frame[APP_VISION_TX_FRAME_MAX_LEN];
+    int length;
+
+    if (status == 0)
+    {
+        return false;
+    }
+    length = snprintf(frame, sizeof(frame), "result_ack:%u,%s\n", (unsigned int)sequence, status);
+    return ((length > 0) && ((uint32_t)length < sizeof(frame)) &&
+            Vision_SendText(BSP_VISION_PORT_2, frame));
+}
 /* 解析指定视觉串口缓冲中的一批文本帧。 */
 bool Vision_ParseFrame(bsp_vision_port_t port)
 {
