@@ -74,7 +74,8 @@ LR_m_text m_interrupts_start m_text_start+m_text_size-m_interrupts_start {   ; l
   }
   ARM_LIB_STACK m_data_start+m_data_size EMPTY -Stack_Size { ; Stack region growing down
   }
-  RW_m_ncache m_data2_start EMPTY 0 {
+  RW_m_ncache m_data2_start m_data2_size {
+    * (PathPlannerRam)
   }
   RW_m_ncache_unused +0 EMPTY m_data2_size-ImageLength(RW_m_ncache) { ; Empty region added for MPU configuration
   }

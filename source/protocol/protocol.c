@@ -326,7 +326,7 @@ static void Protocol_PrintPathStatus(void)
 static void Protocol_PrintMissionStatus(void)
 {
     mission_status_t status;
-    int32_t values[8];
+    int32_t values[12];
 
     PathPlanner_GetMissionStatus(&status);
     values[0] = (int32_t)status.state;
@@ -337,9 +337,13 @@ static void Protocol_PrintMissionStatus(void)
     values[5] = (int32_t)status.retryCount;
     values[6] = status.mapReady ? 1 : 0;
     values[7] = status.poseReady ? 1 : 0;
+    values[8] = (int32_t)status.activePlanStep;
+    values[9] = (int32_t)status.activePlanSteps;
+    values[10] = (int32_t)status.plannerJobStatus;
+    values[11] = status.backgroundPlanning ? 1 : 0;
 
     PRINTF("mission:");
-    Protocol_PrintInt32List(values, 8U);
+    Protocol_PrintInt32List(values, 12U);
     PUTCHAR('\n');
 }
 
