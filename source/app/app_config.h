@@ -1,6 +1,10 @@
 #ifndef APP_CONFIG_H
 #define APP_CONFIG_H
 
+#ifndef APP_PLANNER_BENCHMARK_ENABLE
+#define APP_PLANNER_BENCHMARK_ENABLE (0U)
+#endif
+
 
 
 
@@ -109,4 +113,3 @@
 #define APP_IMU_PRINT_PERIOD_MS (100U)
 
 #endif
-

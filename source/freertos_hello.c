@@ -17,6 +17,7 @@
 #include "bsp/bsp_motor.h"
 #include "bsp/bsp_uart.h"
 #include "chassis/chassis.h"
+#include "path/planner_benchmark.h"
 #include "path/path_planner.h"
 #include "protocol/protocol.h"
 #include "sensor/imu.h"
@@ -27,6 +28,15 @@ int main(void)
 {
     BOARD_InitHardware();
     USER_LED_INIT(LOGIC_LED_OFF);
+
+#if APP_PLANNER_BENCHMARK_ENABLE
+    PlannerBenchmark_RunAll();
+    USER_LED_ON();
+    for (;;)
+    {
+        __NOP();
+    }
+#endif
 
     BSP_MotorInit();
     BSP_EncoderInit();
