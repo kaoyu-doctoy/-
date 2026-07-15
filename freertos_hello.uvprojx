@@ -354,7 +354,7 @@
             <useXO>0</useXO>
             <ClangAsOpt>2</ClangAsOpt>
             <VariousControls>
-              <MiscControls>-include ../mcux_config.h</MiscControls>
+              <MiscControls>-include mcux_config.h</MiscControls>
               <Define>MCUXPRESSO_SDK, CPU_MIMXRT1064DVL6A, MIMXRT1064_SERIES</Define>
               <Undefine></Undefine>
               <IncludePath>source;CMSIS;CMSIS/m-profile;component/uart;device;device/periph;drivers;freertos/freertos-kernel/include;freertos/freertos-kernel/portable/GCC/ARM_CM4F;freertos/freertos-kernel/template;freertos/freertos-kernel/template/ARM_CM4F_4_priority_bits;utilities;utilities/debug_console_lite;utilities/str;xip</IncludePath>
@@ -1255,6 +1255,16 @@
               <FilePath>.\source\path\path_planner.h</FilePath>
             </File>
             <File>
+              <FileName>planner.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\source\path\planner.c</FilePath>
+            </File>
+            <File>
+              <FileName>planner.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\source\path\planner.h</FilePath>
+            </File>
+            <File>
               <FileName>protocol.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\source\protocol\protocol.c</FilePath>
@@ -1731,7 +1741,7 @@
             <useXO>0</useXO>
             <ClangAsOpt>2</ClangAsOpt>
             <VariousControls>
-              <MiscControls>-include ../mcux_config.h</MiscControls>
+              <MiscControls>-include mcux_config.h</MiscControls>
               <Define>MCUXPRESSO_SDK, CPU_MIMXRT1064DVL6A, MIMXRT1064_SERIES</Define>
               <Undefine></Undefine>
               <IncludePath>source;CMSIS;CMSIS/m-profile;component/uart;device;device/periph;drivers;freertos/freertos-kernel/include;freertos/freertos-kernel/portable/GCC/ARM_CM4F;freertos/freertos-kernel/template;freertos/freertos-kernel/template/ARM_CM4F_4_priority_bits;utilities;utilities/debug_console_lite;utilities/str;xip</IncludePath>
@@ -2630,6 +2640,16 @@
               <FileName>path_planner.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\source\path\path_planner.h</FilePath>
+            </File>
+            <File>
+              <FileName>planner.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\source\path\planner.c</FilePath>
+            </File>
+            <File>
+              <FileName>planner.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\source\path\planner.h</FilePath>
             </File>
             <File>
               <FileName>protocol.c</FileName>
@@ -4010,6 +4030,16 @@
               <FilePath>.\source\path\path_planner.h</FilePath>
             </File>
             <File>
+              <FileName>planner.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\source\path\planner.c</FilePath>
+            </File>
+            <File>
+              <FileName>planner.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\source\path\planner.h</FilePath>
+            </File>
+            <File>
               <FileName>protocol.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\source\protocol\protocol.c</FilePath>
@@ -4486,7 +4516,7 @@
             <useXO>0</useXO>
             <ClangAsOpt>2</ClangAsOpt>
             <VariousControls>
-              <MiscControls>-include ../mcux_config.h</MiscControls>
+              <MiscControls>-include mcux_config.h</MiscControls>
               <Define>MCUXPRESSO_SDK, CPU_MIMXRT1064DVL6A, MIMXRT1064_SERIES</Define>
               <Undefine></Undefine>
               <IncludePath>source;CMSIS;CMSIS/m-profile;component/uart;device;device/periph;drivers;freertos/freertos-kernel/include;freertos/freertos-kernel/portable/GCC/ARM_CM4F;freertos/freertos-kernel/template;freertos/freertos-kernel/template/ARM_CM4F_4_priority_bits;utilities;utilities/debug_console_lite;utilities/str;xip</IncludePath>
@@ -5387,6 +5417,16 @@
               <FilePath>.\source\path\path_planner.h</FilePath>
             </File>
             <File>
+              <FileName>planner.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\source\path\planner.c</FilePath>
+            </File>
+            <File>
+              <FileName>planner.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\source\path\planner.h</FilePath>
+            </File>
+            <File>
               <FileName>protocol.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\source\protocol\protocol.c</FilePath>
@@ -5863,7 +5903,7 @@
             <useXO>0</useXO>
             <ClangAsOpt>2</ClangAsOpt>
             <VariousControls>
-              <MiscControls>-include ../mcux_config.h</MiscControls>
+              <MiscControls>-include mcux_config.h</MiscControls>
               <Define>MCUXPRESSO_SDK, CPU_MIMXRT1064DVL6A, MIMXRT1064_SERIES</Define>
               <Undefine></Undefine>
               <IncludePath>source;CMSIS;CMSIS/m-profile;component/uart;device;device/periph;drivers;freertos/freertos-kernel/include;freertos/freertos-kernel/portable/GCC/ARM_CM4F;freertos/freertos-kernel/template;freertos/freertos-kernel/template/ARM_CM4F_4_priority_bits;utilities;utilities/debug_console_lite;utilities/str;xip</IncludePath>
@@ -6764,6 +6804,16 @@
               <FilePath>.\source\path\path_planner.h</FilePath>
             </File>
             <File>
+              <FileName>planner.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\source\path\planner.c</FilePath>
+            </File>
+            <File>
+              <FileName>planner.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\source\path\planner.h</FilePath>
+            </File>
+            <File>
               <FileName>protocol.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\source\protocol\protocol.c</FilePath>
@@ -7240,7 +7290,7 @@
             <useXO>0</useXO>
             <ClangAsOpt>2</ClangAsOpt>
             <VariousControls>
-              <MiscControls>-include ../mcux_config.h</MiscControls>
+              <MiscControls>-include mcux_config.h</MiscControls>
               <Define>MCUXPRESSO_SDK, CPU_MIMXRT1064DVL6A, MIMXRT1064_SERIES</Define>
               <Undefine></Undefine>
               <IncludePath>source;CMSIS;CMSIS/m-profile;component/uart;device;device/periph;drivers;freertos/freertos-kernel/include;freertos/freertos-kernel/portable/GCC/ARM_CM4F;freertos/freertos-kernel/template;freertos/freertos-kernel/template/ARM_CM4F_4_priority_bits;utilities;utilities/debug_console_lite;utilities/str;xip</IncludePath>
@@ -8139,6 +8189,16 @@
               <FileName>path_planner.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\source\path\path_planner.h</FilePath>
+            </File>
+            <File>
+              <FileName>planner.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\source\path\planner.c</FilePath>
+            </File>
+            <File>
+              <FileName>planner.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\source\path\planner.h</FilePath>
             </File>
             <File>
               <FileName>protocol.c</FileName>

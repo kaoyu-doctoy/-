@@ -1,118 +1,106 @@
 #include "path_planner.h"
+
 #include "../bsp/bsp_encoder.h"
 #include "../chassis/chassis.h"
 #include "../sensor/imu.h"
 #include "../sensor/vision.h"
 
 #include "FreeRTOS.h"
+#include "fsl_common.h"
+#include "semphr.h"
 #include "task.h"
 
-/*
- * 本文件负责“地图格子路线”到“底盘速度命令”的转换。
- *
- * 当前已经实现的能力：
- * 1. 接收并保存地图字符。
- * 2. 根据 @POSE 设置的小车位置作为起点。
- * 3. 用 BFS 在普通可通行格子中规划到目标点。
- * 4. 把连续同方向的格子合并成路径段。
- * 5. 周期性执行路径段，按编码器计数判断当前段是否完成。
- *
- * 当前还没有实现真正的推箱子状态搜索。
- * 因此 '$' 箱子在普通寻路中暂时当作不可通行格，后续队友写推箱子时
- * 可以复用地图字符宏，但需要另写“人和箱子状态一起搜索”的逻辑。
- */
+#include <math.h>
+#include <string.h>
 
-/*
- * 一个路径段。
- * 例如连续向 X+ 走 3 格，会被合并为 {PATH_DIR_X_POS, 3}，
- * 这样执行时只需要启动一次底盘速度并等待对应编码器计数完成。
- */
-typedef struct
+typedef enum
 {
-    path_dir_t dir; /* 当前段移动方向。 */
-    uint8_t cells;  /* 当前段连续移动的格子数。 */
-} path_step_t;
+    PLANNER_JOB_MODE_NONE = 0,
+    PLANNER_JOB_MODE_CURRENT,
+    PLANNER_JOB_MODE_PREDICTED
+} planner_job_mode_t;
 
-/* 路径规划整体状态。 */
 static path_state_t s_pathState;
+static mission_state_t s_missionState;
+static SemaphoreHandle_t s_stateMutex;
 
-/*
- * 路径规划专用大容量RAM。
- * 该数组由scatter文件放入0x20200000开始的700KB区域，
- * 不占用FreeRTOS的10KB动态内存。
- */
-__attribute__((used, section("PathPlannerRam"), aligned(32)))
-static uint8_t s_pathPlannerWorkspace[APP_PATH_PLANNER_RAM_SIZE];
+/* PlannerState 是 car 中地图、物体标签、炸弹和离散位姿的唯一真值。 */
+static PlannerState s_plannerState;
+static PlannerState s_predictedState;
+static PlannerState s_stepExpectedState;
 
-/* 当前地图缓存，数组下标为 s_map[y][x]。 */
-static char s_map[APP_MAP_MAX_HEIGHT][APP_MAP_MAX_WIDTH];
-static uint8_t s_mapWidth;
-static uint8_t s_mapHeight;
-static bool s_mapReady;
+static PlannerPlan s_activePlan;
+static PlannerPlan s_queuedPlan;
+static PlannerPlan s_jobPlan;
+static bool s_activePlanValid;
+static bool s_queuedPlanValid;
+static bool s_predictionValid;
+static bool s_predictionComplete;
+static bool s_manualPlan;
+static uint16_t s_activeStepIndex;
+static planner_job_mode_t s_jobMode;
+static int s_plannerJobStatus;
 
-/* 当前认为的小车地图位姿，由 @POSE 或视觉端 pose 数据设置。 */
-static bool s_poseReady;
-static uint8_t s_poseX;
-static uint8_t s_poseY;
+static uint16_t s_cellSizeMm;
 static path_dir_t s_heading;
 
-/* 单个地图格子的实际边长，单位 mm，用于把“格数”换算成行驶距离。 */
-static uint16_t s_cellSizeMm;
+static bool s_motionActive;
+static float s_motionVx;
+static float s_motionVy;
+static int16_t s_motionTargetYawCentiDeg;
+static int32_t s_motionTargetCounts;
+static int32_t s_motionTravelledCounts;
 
-/* 已经规划好的路径段队列。 */
-static path_step_t s_steps[APP_PATH_MAX_STEPS];
-static uint16_t s_stepCount;
-static uint16_t s_stepIndex;
-
-/*
- * 当前正在执行的路径段状态。
- * 每启动一段会清零编码器，然后根据平均绝对编码器计数判断是否走够。
- */
-static bool s_segmentActive;
-static path_dir_t s_segmentDir;
-static int32_t s_segmentTargetCounts;
-static int32_t s_segmentTravelledCounts;
-static int16_t s_segmentTargetYawCentiDeg;
-
-/*
- * BFS 临时缓存。
- * s_bfsQueue 保存待搜索格子索引，s_bfsParent 记录每个格子从哪里来，
- * s_reverseDirs 用于从目标点反向回溯后再转成正向路径。
- */
-static uint16_t s_bfsQueue[APP_PATH_MAX_STEPS];
-static int16_t s_bfsParent[APP_PATH_MAX_STEPS];
-static uint8_t s_bfsVisited[APP_PATH_MAX_STEPS];
-static path_dir_t s_reverseDirs[APP_PATH_MAX_STEPS];
-static uint16_t s_bfsDistance[APP_PATH_MAX_STEPS];
-
-/* 巡检识别任务状态：地图字符保存类型，编号单独保存在 s_objectCode。 */
-static volatile mission_state_t s_missionState;
-static recognition_point_t s_recognitionPoints[APP_MISSION_MAX_RECOGNITION_POINTS];
-static uint8_t s_objectCode[APP_MAP_MAX_HEIGHT][APP_MAP_MAX_WIDTH];
-static uint16_t s_recognitionPointCount;
-static volatile uint16_t s_recognizedCount;
-static volatile uint16_t s_currentRecognitionPoint;
-static volatile uint16_t s_missionRequestSequence;
-static volatile uint16_t s_missionRetryCount;
-static TickType_t s_missionStateTick;
-static path_dir_t s_missionDefaultHeading;
 static path_dir_t s_rotationTargetHeading;
 static int16_t s_rotationTargetYawCentiDeg;
 static uint8_t s_rotationStableCount;
+static TickType_t s_missionStateTick;
 
-/* 判断路径方向枚举是否有效。 */
+static recognition_point_t s_recognitionPoints[APP_MISSION_MAX_RECOGNITION_POINTS];
+static uint16_t s_recognitionPointCount;
+static uint16_t s_recognizedCount;
+static uint16_t s_currentRecognitionPoint;
+static uint16_t s_missionRequestSequence;
+static uint16_t s_missionRetryCount;
+static bool s_missionMapAccepted;
+
+static bool s_pendingPoseValid;
+static uint8_t s_pendingPoseX;
+static uint8_t s_pendingPoseY;
+static path_dir_t s_pendingPoseHeading;
+
+static const int8_t s_plannerDx[4] = {0, 1, 0, -1};
+static const int8_t s_plannerDy[4] = {-1, 0, 1, 0};
+
+static void Mission_TryBeginPlanningLocked(void);
+static void Planner_InstallPlanLocked(const PlannerPlan *plan, bool manualPlan);
+static void Mission_FinishActivePlanLocked(void);
+
+static bool PathPlanner_Lock(void)
+{
+    return (s_stateMutex != 0) && (xSemaphoreTake(s_stateMutex, portMAX_DELAY) == pdTRUE);
+}
+
+static void PathPlanner_Unlock(void)
+{
+    (void)xSemaphoreGive(s_stateMutex);
+}
+
 static bool PathPlanner_IsValidDir(path_dir_t dir)
 {
     return ((uint32_t)dir <= (uint32_t)PATH_DIR_Y_NEG);
 }
 
-/* 返回 int32_t 绝对值，避免到处重复写符号判断。 */
 static int32_t PathPlanner_AbsInt32(int32_t value)
 {
     return (value < 0) ? -value : value;
 }
 
-/* 把浮点值限制到给定范围内，用于限制 yaw 修正角速度。 */
+static int32_t PathPlanner_MaxInt32(int32_t a, int32_t b)
+{
+    return (a > b) ? a : b;
+}
+
 static float PathPlanner_ClampFloat(float value, float minValue, float maxValue)
 {
     if (value < minValue)
@@ -126,258 +114,22 @@ static float PathPlanner_ClampFloat(float value, float minValue, float maxValue)
     return value;
 }
 
-/* 清空当前路径段队列和正在执行的段。 */
-static void PathPlanner_ClearSteps(void)
+static int PathPlanner_PathDirToPlannerDir(path_dir_t dir)
 {
-    s_stepCount = 0U;
-    s_stepIndex = 0U;
-    s_segmentActive = false;
-    s_segmentTargetCounts = 0;
-    s_segmentTravelledCounts = 0;
+    return (((int)dir + 1) & 3);
 }
 
-/* 判断地图坐标是否在当前已加载地图范围内。 */
-static bool PathPlanner_IsInside(uint8_t x, uint8_t y)
+static path_dir_t PathPlanner_PlannerDirToPathDir(int dir)
 {
-    return (s_mapReady && (x < s_mapWidth) && (y < s_mapHeight));
+    return (path_dir_t)((dir + 3) & 3);
 }
 
-/* 判断视觉端收到的地图字符是否合法。 */
-bool PathPlanner_IsMapCellValid(char cell)
+static bool PathPlanner_MapReadyLocked(void)
 {
-    return ((cell == PATH_MAP_CELL_WALL) || (cell == PATH_MAP_CELL_EMPTY) ||
-            (cell == PATH_MAP_CELL_GOAL) || (cell == PATH_MAP_CELL_BOMB) ||
-            (cell == PATH_MAP_CELL_BOX));
+    return (s_plannerState.width > 0) && (s_plannerState.height > 0);
 }
 
-/*
- * 判断字符在普通车辆寻路中能否通过。
- * 注意：这是“车辆中心能不能直接走过去”的判断，不是推箱子判断。
- */
-bool PathPlanner_IsMapCellPassableChar(char cell)
-{
-    return ((cell == PATH_MAP_CELL_EMPTY) || (cell == PATH_MAP_CELL_GOAL));
-}
-
-/* 判断某个地图坐标是否允许普通寻路通过。 */
-static bool PathPlanner_IsPassable(uint8_t x, uint8_t y)
-{
-    char cell;
-
-    if (!PathPlanner_IsInside(x, y))
-    {
-        return false;
-    }
-
-    cell = s_map[y][x];
-    return PathPlanner_IsMapCellPassableChar(cell);
-}
-
-/* 把二维地图坐标换算为一维数组索引，供 BFS 队列和 parent 数组使用。 */
-static uint16_t PathPlanner_ToIndex(uint8_t x, uint8_t y)
-{
-    return (uint16_t)(((uint16_t)y * (uint16_t)s_mapWidth) + (uint16_t)x);
-}
-
-/* 根据相邻两个格子的坐标推导从前一个格子到后一个格子的移动方向。 */
-static path_dir_t PathPlanner_GetDirBetween(uint8_t fromX, uint8_t fromY, uint8_t toX, uint8_t toY)
-{
-    if (toX > fromX)
-    {
-        return PATH_DIR_X_POS;
-    }
-    if (toX < fromX)
-    {
-        return PATH_DIR_X_NEG;
-    }
-    if (toY > fromY)
-    {
-        return PATH_DIR_Y_POS;
-    }
-    return PATH_DIR_Y_NEG;
-}
-
-/*
- * 把一步移动加入路径队列。
- * 如果新方向和上一段方向相同，就合并成一段更长的移动，减少启停次数。
- */
-static bool PathPlanner_AddStep(path_dir_t dir)
-{
-    path_step_t *lastStep;
-
-    if (s_stepCount > 0U)
-    {
-        lastStep = &s_steps[s_stepCount - 1U];
-        if ((lastStep->dir == dir) && (lastStep->cells < 255U))
-        {
-            lastStep->cells++;
-            return true;
-        }
-    }
-
-    if (s_stepCount >= APP_PATH_MAX_STEPS)
-    {
-        return false;
-    }
-
-    s_steps[s_stepCount].dir = dir;
-    s_steps[s_stepCount].cells = 1U;
-    s_stepCount++;
-    return true;
-}
-
-/* 把地图方向转换成底盘 vx/vy 速度目标，单位 m/s。 */
-static void PathPlanner_DirToVelocity(path_dir_t dir, float *vx, float *vy)
-{
-    *vx = 0.0f;
-    *vy = 0.0f;
-
-    if (dir == PATH_DIR_X_POS)
-    {
-        *vx = APP_PATH_DRIVE_SPEED_MPS;
-    }
-    else if (dir == PATH_DIR_X_NEG)
-    {
-        *vx = -APP_PATH_DRIVE_SPEED_MPS;
-    }
-    else if (dir == PATH_DIR_Y_POS)
-    {
-        *vy = APP_PATH_DRIVE_SPEED_MPS;
-    }
-    else
-    {
-        *vy = -APP_PATH_DRIVE_SPEED_MPS;
-    }
-}
-
-/* 计算最短角度误差，单位 0.01 度，结果范围约为 -18000 到 18000。 */
-static int16_t PathPlanner_GetYawError(int16_t targetCentiDeg, int16_t currentCentiDeg)
-{
-    int32_t error;
-
-    error = (int32_t)targetCentiDeg - (int32_t)currentCentiDeg;
-    while (error > 18000L)
-    {
-        error -= 36000L;
-    }
-    while (error < -18000L)
-    {
-        error += 36000L;
-    }
-
-    return (int16_t)error;
-}
-
-/*
- * 获取当前车体 yaw。
- * 优先使用视觉端角度；视觉数据超时或无效时，退回 IMU 相对 yaw。
- */
-static int16_t PathPlanner_GetCurrentYaw(void)
-{
-    int16_t yaw;
-
-    if (Vision_GetYawCentiDeg(&yaw))
-    {
-        return yaw;
-    }
-
-    return IMU_GetRelativeYawCentiDeg();
-}
-
-/*
- * 根据当前 yaw 偏差生成 wz 修正量。
- * 作用是让小车在执行一个直线段时尽量保持启动该段时的车身角度。
- */
-static float PathPlanner_GetYawHoldWz(void)
-{
-    int16_t currentYaw;
-    int16_t error;
-    float correction;
-
-    currentYaw = PathPlanner_GetCurrentYaw();
-    error = PathPlanner_GetYawError(s_segmentTargetYawCentiDeg, currentYaw);
-    correction = ((float)error / 100.0f) * APP_PATH_YAW_HOLD_KP_RADPS_PER_DEG;
-    return PathPlanner_ClampFloat(correction, -APP_PATH_YAW_HOLD_MAX_RADPS, APP_PATH_YAW_HOLD_MAX_RADPS);
-}
-
-/* 按当前路径段方向和 yaw 修正量刷新底盘速度目标。 */
-static void PathPlanner_UpdateSegmentVelocity(void)
-{
-    float vx;
-    float vy;
-    float wz;
-
-    PathPlanner_DirToVelocity(s_segmentDir, &vx, &vy);
-    wz = PathPlanner_GetYawHoldWz();
-    Chassis_SetVelocity(vx, vy, wz);
-}
-
-/* 当前路径段完成后，更新模块内部记录的小车地图坐标。 */
-static void PathPlanner_ApplyFinishedStep(const path_step_t *step)
-{
-    if (step == 0)
-    {
-        return;
-    }
-
-    if (step->dir == PATH_DIR_X_POS)
-    {
-        s_poseX = (uint8_t)(s_poseX + step->cells);
-    }
-    else if (step->dir == PATH_DIR_X_NEG)
-    {
-        s_poseX = (s_poseX >= step->cells) ? (uint8_t)(s_poseX - step->cells) : 0U;
-    }
-    else if (step->dir == PATH_DIR_Y_POS)
-    {
-        s_poseY = (uint8_t)(s_poseY + step->cells);
-    }
-    else
-    {
-        s_poseY = (s_poseY >= step->cells) ? (uint8_t)(s_poseY - step->cells) : 0U;
-    }
-}
-
-/*
- * 启动路径队列中的下一段。
- * 这里会把“格子数”换算为实际距离，再换算为编码器计数目标。
- */
-static bool PathPlanner_StartNextSegment(void)
-{
-    float distanceM;
-    int32_t targetCounts;
-
-    if (s_stepIndex >= s_stepCount)
-    {
-        Chassis_Stop();
-        s_segmentActive = false;
-        s_pathState = PATH_STATE_FINISHED;
-        return false;
-    }
-
-    distanceM = ((float)s_cellSizeMm * (float)s_steps[s_stepIndex].cells) / 1000.0f;
-    targetCounts = PathPlanner_AbsInt32(Chassis_DistanceMToEncoderCounts(distanceM));
-    if (targetCounts <= 0)
-    {
-        Chassis_Stop();
-        s_segmentActive = false;
-        s_pathState = PATH_STATE_ERROR;
-        return false;
-    }
-
-    s_segmentDir = s_steps[s_stepIndex].dir;
-    s_segmentTargetCounts = targetCounts;
-    s_segmentTravelledCounts = 0;
-    s_segmentTargetYawCentiDeg = PathPlanner_GetCurrentYaw();
-    s_segmentActive = true;
-
-    BSP_EncoderClearAll();
-    PathPlanner_UpdateSegmentVelocity();
-    return true;
-}
-
-/* 把任意角度归一化到 -180.00～180.00 度。 */
-static int16_t Mission_NormalizeYaw(int32_t yawCentiDeg)
+static int16_t PathPlanner_NormalizeYaw(int32_t yawCentiDeg)
 {
     while (yawCentiDeg > 18000L)
     {
@@ -390,24 +142,26 @@ static int16_t Mission_NormalizeYaw(int32_t yawCentiDeg)
     return (int16_t)yawCentiDeg;
 }
 
-/* 将地图四方向转换成视觉/IMU使用的绝对yaw目标。 */
-static int16_t Mission_HeadingToYaw(path_dir_t heading)
+static int16_t PathPlanner_HeadingToYaw(path_dir_t heading)
 {
-    int32_t yaw;
-
-    yaw = APP_MAP_X_POS_YAW_CDEG +
-          (APP_MAP_YAW_DIRECTION_SIGN * (int32_t)heading * 9000L);
-    return Mission_NormalizeYaw(yaw);
+    int32_t yaw = APP_MAP_X_POS_YAW_CDEG +
+                  (APP_MAP_YAW_DIRECTION_SIGN * (int32_t)heading * 9000L);
+    return PathPlanner_NormalizeYaw(yaw);
 }
 
-static uint8_t Mission_GetQuarterTurns(path_dir_t from, path_dir_t to)
+static int16_t PathPlanner_GetYawError(int16_t targetCentiDeg, int16_t currentCentiDeg)
 {
-    uint8_t difference;
+    return PathPlanner_NormalizeYaw((int32_t)targetCentiDeg - (int32_t)currentCentiDeg);
+}
 
-    difference = ((uint8_t)from > (uint8_t)to) ?
-                     (uint8_t)((uint8_t)from - (uint8_t)to) :
-                     (uint8_t)((uint8_t)to - (uint8_t)from);
-    return (difference > 2U) ? (uint8_t)(4U - difference) : difference;
+static int16_t PathPlanner_GetCurrentYaw(void)
+{
+    int16_t yaw;
+    if (Vision_GetYawCentiDeg(&yaw))
+    {
+        return yaw;
+    }
+    return IMU_GetRelativeYawCentiDeg();
 }
 
 static uint16_t Mission_NextSequence(void)
@@ -420,209 +174,349 @@ static uint16_t Mission_NextSequence(void)
     return s_missionRequestSequence;
 }
 
-/* 扫描地图中的箱子和目标点，并清空上一次识别得到的编号。 */
-static bool Mission_BuildRecognitionPoints(void)
+static PlannerObject *PathPlanner_FindObjectByIdLocked(int objectId)
 {
-    uint8_t x;
-    uint8_t y;
-    recognition_point_t *point;
+    int index;
+    for (index = 0; index < s_plannerState.object_count; index++)
+    {
+        if (s_plannerState.objects[index].id == objectId)
+        {
+            return &s_plannerState.objects[index];
+        }
+    }
+    return 0;
+}
 
+static void PathPlanner_ClearRuntimeLocked(void)
+{
+    Chassis_Stop();
+    memset(&s_activePlan, 0, sizeof(s_activePlan));
+    memset(&s_queuedPlan, 0, sizeof(s_queuedPlan));
+    memset(&s_jobPlan, 0, sizeof(s_jobPlan));
+    s_activePlanValid = false;
+    s_queuedPlanValid = false;
+    s_predictionValid = false;
+    s_predictionComplete = false;
+    s_manualPlan = false;
+    s_activeStepIndex = 0U;
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    s_plannerJobStatus = PLANNER_JOB_IDLE;
+    s_motionActive = false;
+    s_motionVx = 0.0f;
+    s_motionVy = 0.0f;
+    s_motionTargetCounts = 0;
+    s_motionTravelledCounts = 0;
+}
+
+static void Mission_ClearRecognitionLocked(void)
+{
+    uint16_t index;
+    memset(s_recognitionPoints, 0, sizeof(s_recognitionPoints));
+    for (index = 0U; index < APP_MISSION_MAX_RECOGNITION_POINTS; index++)
+    {
+        s_recognitionPoints[index].resultCode = APP_RECOGNITION_CODE_UNKNOWN;
+    }
     s_recognitionPointCount = 0U;
     s_recognizedCount = 0U;
     s_currentRecognitionPoint = 0U;
-
-    for (y = 0U; y < APP_MAP_MAX_HEIGHT; y++)
-    {
-        for (x = 0U; x < APP_MAP_MAX_WIDTH; x++)
-        {
-            s_objectCode[y][x] = APP_RECOGNITION_CODE_UNKNOWN;
-        }
-    }
-
-    for (y = 0U; y < s_mapHeight; y++)
-    {
-        for (x = 0U; x < s_mapWidth; x++)
-        {
-            if ((s_map[y][x] != PATH_MAP_CELL_BOX) && (s_map[y][x] != PATH_MAP_CELL_GOAL))
-            {
-                continue;
-            }
-            if (s_recognitionPointCount >= APP_MISSION_MAX_RECOGNITION_POINTS)
-            {
-                return false;
-            }
-
-            point = &s_recognitionPoints[s_recognitionPointCount];
-            point->objectX = x;
-            point->objectY = y;
-            point->observeX = x;
-            point->observeY = y;
-            point->observeDir = PATH_DIR_X_POS;
-            point->resultCode = APP_RECOGNITION_CODE_UNKNOWN;
-            point->recognized = false;
-            s_recognitionPointCount++;
-        }
-    }
-
-    return true;
 }
 
-/* 从小车当前位置进行一次BFS，得到所有可通行格子的最短距离。 */
-static bool Mission_FillDistances(void)
+static bool Mission_BuildRecognitionRecordsLocked(void)
 {
-    uint16_t cellCount;
-    uint16_t head = 0U;
-    uint16_t tail = 0U;
-    uint16_t index;
-    uint16_t currentIndex;
-    uint16_t nextIndex;
-    uint8_t currentX;
-    uint8_t currentY;
-    int16_t nextX;
-    int16_t nextY;
-    int8_t dx[4] = {1, 0, -1, 0};
-    int8_t dy[4] = {0, 1, 0, -1};
-    uint8_t direction;
-
-    if (!s_poseReady || !PathPlanner_IsPassable(s_poseX, s_poseY))
+    int index;
+    Mission_ClearRecognitionLocked();
+    for (index = 0; index < s_plannerState.object_count; index++)
     {
-        return false;
-    }
-
-    cellCount = (uint16_t)((uint16_t)s_mapWidth * (uint16_t)s_mapHeight);
-    for (index = 0U; index < cellCount; index++)
-    {
-        s_bfsVisited[index] = 0U;
-        s_bfsDistance[index] = 0xFFFFU;
-    }
-
-    currentIndex = PathPlanner_ToIndex(s_poseX, s_poseY);
-    s_bfsQueue[tail++] = currentIndex;
-    s_bfsVisited[currentIndex] = 1U;
-    s_bfsDistance[currentIndex] = 0U;
-
-    while (head < tail)
-    {
-        currentIndex = s_bfsQueue[head++];
-        currentX = (uint8_t)(currentIndex % s_mapWidth);
-        currentY = (uint8_t)(currentIndex / s_mapWidth);
-
-        for (direction = 0U; direction < 4U; direction++)
+        const PlannerObject *object = &s_plannerState.objects[index];
+        recognition_point_t *point;
+        if (object->id < 0 || object->id >= APP_MISSION_MAX_RECOGNITION_POINTS)
         {
-            nextX = (int16_t)currentX + dx[direction];
-            nextY = (int16_t)currentY + dy[direction];
-            if ((nextX < 0) || (nextY < 0) ||
-                (nextX >= (int16_t)s_mapWidth) || (nextY >= (int16_t)s_mapHeight) ||
-                !PathPlanner_IsPassable((uint8_t)nextX, (uint8_t)nextY))
-            {
-                continue;
-            }
-
-            nextIndex = PathPlanner_ToIndex((uint8_t)nextX, (uint8_t)nextY);
-            if (s_bfsVisited[nextIndex] != 0U)
-            {
-                continue;
-            }
-
-            s_bfsVisited[nextIndex] = 1U;
-            s_bfsDistance[nextIndex] = (uint16_t)(s_bfsDistance[currentIndex] + 1U);
-            s_bfsQueue[tail++] = nextIndex;
+            return false;
+        }
+        point = &s_recognitionPoints[object->id];
+        point->objectX = (uint8_t)object->x;
+        point->objectY = (uint8_t)object->y;
+        point->observeX = (uint8_t)object->x;
+        point->observeY = (uint8_t)object->y;
+        point->observeDir = PATH_DIR_X_POS;
+        if ((uint16_t)(object->id + 1) > s_recognitionPointCount)
+        {
+            s_recognitionPointCount = (uint16_t)(object->id + 1);
         }
     }
-
     return true;
 }
 
-/* 从全部未识别物体的相邻格中选择行驶距离和转向代价最小的观察位姿。 */
-static bool Mission_SelectNextObservation(void)
+static void Mission_UpdateRecognitionPositionsLocked(void)
 {
-    uint16_t pointIndex;
-    uint16_t cellIndex;
-    uint16_t distance;
-    uint8_t direction;
-    uint8_t turnCount;
-    uint32_t score;
-    uint32_t bestScore = 0xFFFFFFFFUL;
-    uint16_t bestPoint = 0U;
-    uint8_t bestX = 0U;
-    uint8_t bestY = 0U;
-    path_dir_t bestDirection = PATH_DIR_X_POS;
-    int16_t observeX;
-    int16_t observeY;
-    int8_t dx[4] = {1, 0, -1, 0};
-    int8_t dy[4] = {0, 1, 0, -1};
-    bool found = false;
-    recognition_point_t *point;
+    int index;
+    for (index = 0; index < s_plannerState.object_count; index++)
+    {
+        const PlannerObject *object = &s_plannerState.objects[index];
+        if (object->id >= 0 && object->id < s_recognitionPointCount)
+        {
+            s_recognitionPoints[object->id].objectX = (uint8_t)object->x;
+            s_recognitionPoints[object->id].objectY = (uint8_t)object->y;
+        }
+    }
+}
 
-    if (!Mission_FillDistances())
+static bool PathPlanner_StatesEquivalentForPlanning(
+    const PlannerState *left,
+    const PlannerState *right)
+{
+    int index;
+    if (left->width != right->width || left->height != right->height ||
+        left->car_x != right->car_x || left->car_y != right->car_y ||
+        left->car_dir != right->car_dir || left->pose_valid != right->pose_valid ||
+        left->object_count != right->object_count ||
+        left->forbidden_match_count != right->forbidden_match_count ||
+        memcmp(left->wall_bits, right->wall_bits, PLANNER_BITSET_BYTES) != 0 ||
+        memcmp(left->bomb_bits, right->bomb_bits, PLANNER_BITSET_BYTES) != 0)
     {
         return false;
     }
-
-    for (pointIndex = 0U; pointIndex < s_recognitionPointCount; pointIndex++)
+    for (index = 0; index < left->object_count; index++)
     {
-        point = &s_recognitionPoints[pointIndex];
-        if (point->recognized)
+        const PlannerObject *a = &left->objects[index];
+        const PlannerObject *b = &right->objects[index];
+        if (a->id != b->id || a->x != b->x || a->y != b->y ||
+            a->label != b->label || a->kind != b->kind || a->known != b->known)
         {
-            continue;
-        }
-
-        for (direction = 0U; direction < 4U; direction++)
-        {
-            /* direction 是从观察格朝向物体的方向，因此观察格位于反方向。 */
-            observeX = (int16_t)point->objectX - dx[direction];
-            observeY = (int16_t)point->objectY - dy[direction];
-            if ((observeX < 0) || (observeY < 0) ||
-                (observeX >= (int16_t)s_mapWidth) || (observeY >= (int16_t)s_mapHeight) ||
-                !PathPlanner_IsPassable((uint8_t)observeX, (uint8_t)observeY))
-            {
-                continue;
-            }
-
-            cellIndex = PathPlanner_ToIndex((uint8_t)observeX, (uint8_t)observeY);
-            distance = s_bfsDistance[cellIndex];
-            if (distance == 0xFFFFU)
-            {
-                continue;
-            }
-
-            turnCount = Mission_GetQuarterTurns(s_missionDefaultHeading, (path_dir_t)direction);
-            score = ((uint32_t)distance * APP_MISSION_PATH_COST_PER_CELL) +
-                    ((uint32_t)turnCount * APP_MISSION_TURN_COST_PER_QUARTER);
-            if (score < bestScore)
-            {
-                bestScore = score;
-                bestPoint = pointIndex;
-                bestX = (uint8_t)observeX;
-                bestY = (uint8_t)observeY;
-                bestDirection = (path_dir_t)direction;
-                found = true;
-            }
+            return false;
         }
     }
-
-    if (!found)
+    for (index = 0; index < left->forbidden_match_count; index++)
     {
-        return false;
+        if (left->forbidden_matches[index].box_id != right->forbidden_matches[index].box_id ||
+            left->forbidden_matches[index].destination_id != right->forbidden_matches[index].destination_id)
+        {
+            return false;
+        }
     }
-
-    s_currentRecognitionPoint = bestPoint;
-    s_recognitionPoints[bestPoint].observeX = bestX;
-    s_recognitionPoints[bestPoint].observeY = bestY;
-    s_recognitionPoints[bestPoint].observeDir = bestDirection;
     return true;
 }
 
-static void Mission_StartRotation(path_dir_t targetHeading)
+static bool Mission_ApplyPoseLocked(uint8_t x, uint8_t y, path_dir_t heading)
+{
+    if (!PathPlanner_IsValidDir(heading) ||
+        !planner_state_set_pose(
+            &s_plannerState,
+            x,
+            y,
+            PathPlanner_PathDirToPlannerDir(heading),
+            PathPlanner_HeadingToYaw(heading)))
+    {
+        return false;
+    }
+    s_heading = heading;
+    return true;
+}
+
+static void Mission_ApplyPendingPoseLocked(void)
+{
+    if (!s_pendingPoseValid)
+    {
+        return;
+    }
+    (void)Mission_ApplyPoseLocked(s_pendingPoseX, s_pendingPoseY, s_pendingPoseHeading);
+    s_pendingPoseValid = false;
+}
+
+static void Mission_SetErrorLocked(void)
+{
+    Chassis_Stop();
+    s_motionActive = false;
+    s_activePlanValid = false;
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    s_plannerJobStatus = PLANNER_JOB_FAILED;
+    s_pathState = PATH_STATE_ERROR;
+    s_missionState = MISSION_STATE_ERROR;
+}
+
+static void Mission_SetFinishedLocked(void)
+{
+    Chassis_Stop();
+    s_motionActive = false;
+    s_activePlanValid = false;
+    s_queuedPlanValid = false;
+    s_predictionValid = false;
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    s_plannerJobStatus = PLANNER_JOB_DONE;
+    s_pathState = PATH_STATE_FINISHED;
+    s_missionState = MISSION_STATE_FINISHED;
+}
+
+static bool Planner_PlanContainsScan(const PlannerPlan *plan)
+{
+    int index;
+    for (index = 0; index < plan->step_count; index++)
+    {
+        if (plan->steps[index].type == PLANNER_STEP_SCAN)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void Planner_StartPredictionLocked(void)
+{
+    int index;
+    int status;
+
+    s_predictionValid = false;
+    s_predictionComplete = false;
+    s_queuedPlanValid = false;
+    if (s_manualPlan || Planner_PlanContainsScan(&s_activePlan))
+    {
+        return;
+    }
+
+    s_predictedState = s_plannerState;
+    for (index = 0; index < s_activePlan.step_count; index++)
+    {
+        const PlannerStep *step = &s_activePlan.steps[index];
+        if ((step->type != PLANNER_STEP_MOVE && step->type != PLANNER_STEP_PUSH) ||
+            !planner_state_apply_executed_step(&s_predictedState, step))
+        {
+            return;
+        }
+        (void)planner_state_remove_completed_pairs(&s_predictedState);
+    }
+
+    s_predictionValid = true;
+    if (planner_state_is_complete(&s_predictedState))
+    {
+        s_predictionComplete = true;
+        return;
+    }
+    status = planner_job_begin(&s_predictedState);
+    s_plannerJobStatus = status;
+    if (status == PLANNER_JOB_RUNNING)
+    {
+        s_jobMode = PLANNER_JOB_MODE_PREDICTED;
+    }
+    else
+    {
+        s_jobMode = PLANNER_JOB_MODE_NONE;
+    }
+}
+
+static void Planner_InstallPlanLocked(const PlannerPlan *plan, bool manualPlan)
+{
+    if (plan == 0 || !plan->success || plan->step_count <= 0 ||
+        plan->step_count > PLANNER_MAX_PLAN_STEPS)
+    {
+        Mission_SetErrorLocked();
+        return;
+    }
+
+    s_activePlan = *plan;
+    s_activePlanValid = true;
+    s_activeStepIndex = 0U;
+    s_manualPlan = manualPlan;
+    s_motionActive = false;
+    s_queuedPlanValid = false;
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    s_plannerJobStatus = PLANNER_JOB_DONE;
+    s_pathState = PATH_STATE_RUNNING;
+    s_missionState = MISSION_STATE_EXECUTING;
+    Planner_StartPredictionLocked();
+}
+
+static void Mission_TryBeginPlanningLocked(void)
+{
+    int status;
+    if (!s_missionMapAccepted || !PathPlanner_MapReadyLocked() || !s_plannerState.pose_valid)
+    {
+        s_missionState = s_missionMapAccepted ? MISSION_STATE_WAIT_INPUT : MISSION_STATE_WAIT_MAP;
+        return;
+    }
+
+    Mission_ApplyPendingPoseLocked();
+    (void)planner_state_remove_completed_pairs(&s_plannerState);
+    if (planner_state_is_complete(&s_plannerState))
+    {
+        Mission_SetFinishedLocked();
+        return;
+    }
+
+    Chassis_Stop();
+    s_activePlanValid = false;
+    s_queuedPlanValid = false;
+    s_predictionValid = false;
+    s_motionActive = false;
+    status = planner_job_begin(&s_plannerState);
+    s_plannerJobStatus = status;
+    if (status != PLANNER_JOB_RUNNING)
+    {
+        Mission_SetErrorLocked();
+        return;
+    }
+    s_jobMode = PLANNER_JOB_MODE_CURRENT;
+    s_pathState = PATH_STATE_IDLE;
+    s_missionState = MISSION_STATE_PLANNING;
+}
+
+static void Planner_UpdateJobLocked(void)
+{
+    planner_job_mode_t completedMode;
+    int status;
+    uint32_t startCycles;
+    uint32_t sliceCycles;
+    uint32_t sliceUs;
+    if (s_jobMode == PLANNER_JOB_MODE_NONE)
+    {
+        return;
+    }
+
+    completedMode = s_jobMode;
+    sliceUs = s_motionActive ? APP_PLANNER_MOVING_SLICE_US :
+                              APP_PLANNER_STATIONARY_SLICE_US;
+    sliceCycles = (SystemCoreClock / 1000000U) * sliceUs;
+    startCycles = DWT->CYCCNT;
+    do
+    {
+        status = planner_job_step(1U, &s_jobPlan);
+    } while (status == PLANNER_JOB_RUNNING &&
+             (uint32_t)(DWT->CYCCNT - startCycles) < sliceCycles);
+    s_plannerJobStatus = status;
+    if (status == PLANNER_JOB_RUNNING)
+    {
+        return;
+    }
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    if (status != PLANNER_JOB_DONE || !s_jobPlan.success)
+    {
+        if (completedMode == PLANNER_JOB_MODE_CURRENT)
+        {
+            Mission_SetErrorLocked();
+        }
+        return;
+    }
+
+    if (completedMode == PLANNER_JOB_MODE_CURRENT)
+    {
+        Planner_InstallPlanLocked(&s_jobPlan, false);
+    }
+    else
+    {
+        s_queuedPlan = s_jobPlan;
+        s_queuedPlanValid = true;
+    }
+}
+
+static void PathPlanner_StartRotationLocked(path_dir_t targetHeading)
 {
     s_rotationTargetHeading = targetHeading;
-    s_rotationTargetYawCentiDeg = Mission_HeadingToYaw(targetHeading);
+    s_rotationTargetYawCentiDeg = PathPlanner_HeadingToYaw(targetHeading);
     s_rotationStableCount = 0U;
     s_missionStateTick = xTaskGetTickCount();
+    s_missionState = MISSION_STATE_ROTATING;
 }
 
-/* 运行原地转向角度闭环；连续稳定后返回true，超时会进入任务错误状态。 */
-static bool Mission_UpdateRotation(void)
+static void PathPlanner_UpdateRotationLocked(void)
 {
     int16_t currentYaw;
     int16_t error;
@@ -631,11 +525,9 @@ static bool Mission_UpdateRotation(void)
 
     if ((xTaskGetTickCount() - s_missionStateTick) > pdMS_TO_TICKS(APP_MISSION_ROTATE_TIMEOUT_MS))
     {
-        Chassis_Stop();
-        s_missionState = MISSION_STATE_ERROR;
-        return false;
+        Mission_SetErrorLocked();
+        return;
     }
-
     currentYaw = PathPlanner_GetCurrentYaw();
     error = PathPlanner_GetYawError(s_rotationTargetYawCentiDeg, currentYaw);
     absoluteError = PathPlanner_AbsInt32((int32_t)error);
@@ -646,9 +538,11 @@ static bool Mission_UpdateRotation(void)
         if (s_rotationStableCount >= APP_MISSION_YAW_STABLE_COUNT)
         {
             s_heading = s_rotationTargetHeading;
-            return true;
+            s_plannerState.car_dir = PathPlanner_PathDirToPlannerDir(s_heading);
+            s_plannerState.car_yaw_cdeg = s_rotationTargetYawCentiDeg;
+            s_missionState = MISSION_STATE_EXECUTING;
         }
-        return false;
+        return;
     }
 
     s_rotationStableCount = 0U;
@@ -663,98 +557,274 @@ static bool Mission_UpdateRotation(void)
         wz = -APP_MISSION_ROTATE_MIN_RADPS;
     }
     Chassis_SetVelocity(0.0f, 0.0f, wz);
-    return false;
 }
 
-static bool Mission_SendRecognitionRequest(void)
+static void PathPlanner_ApplyMotionVelocityLocked(void)
 {
-    uint16_t sequence;
+    int16_t currentYaw = PathPlanner_GetCurrentYaw();
+    int16_t error = PathPlanner_GetYawError(s_motionTargetYawCentiDeg, currentYaw);
+    float correction = ((float)error / 100.0f) * APP_PATH_YAW_HOLD_KP_RADPS_PER_DEG;
+    correction = PathPlanner_ClampFloat(
+        correction,
+        -APP_PATH_YAW_HOLD_MAX_RADPS,
+        APP_PATH_YAW_HOLD_MAX_RADPS);
+    Chassis_SetVelocity(s_motionVx, s_motionVy, correction);
+}
 
-    sequence = Mission_NextSequence();
-    if (!Vision_RequestRecognition(sequence, s_currentRecognitionPoint))
+static bool PathPlanner_StartMoveLocked(const PlannerStep *step)
+{
+    int32_t dx = (int32_t)step->x - (int32_t)s_plannerState.car_x;
+    int32_t dy = (int32_t)step->y - (int32_t)s_plannerState.car_y;
+    int32_t maxCells;
+    float norm;
+    float distanceM;
+
+    s_stepExpectedState = s_plannerState;
+    if (!planner_state_apply_executed_step(&s_stepExpectedState, step))
     {
-        s_missionState = MISSION_STATE_ERROR;
         return false;
     }
+    if (dx == 0 && dy == 0)
+    {
+        s_plannerState = s_stepExpectedState;
+        s_heading = PathPlanner_PlannerDirToPathDir(step->dir);
+        s_activeStepIndex++;
+        return true;
+    }
 
+    norm = sqrtf(((float)dx * (float)dx) + ((float)dy * (float)dy));
+    if (norm <= 0.0f)
+    {
+        return false;
+    }
+    s_motionVx = APP_PATH_DRIVE_SPEED_MPS * ((float)dx / norm);
+    s_motionVy = APP_PATH_DRIVE_SPEED_MPS * ((float)dy / norm);
+    maxCells = PathPlanner_MaxInt32(PathPlanner_AbsInt32(dx), PathPlanner_AbsInt32(dy));
+    distanceM = ((float)s_cellSizeMm * (float)maxCells) / 1000.0f;
+    s_motionTargetCounts = PathPlanner_AbsInt32(Chassis_DistanceMToEncoderCounts(distanceM));
+    if (s_motionTargetCounts <= 0)
+    {
+        return false;
+    }
+    s_motionTargetYawCentiDeg = PathPlanner_HeadingToYaw(
+        PathPlanner_PlannerDirToPathDir(step->dir));
+    s_motionTravelledCounts = 0;
+    s_motionActive = true;
+    BSP_EncoderClearAll();
+    PathPlanner_ApplyMotionVelocityLocked();
+    return true;
+}
+
+static void Mission_FinishActivePlanLocked(void)
+{
+    bool predictedMatches;
+    Chassis_Stop();
+    s_motionActive = false;
+    s_activePlanValid = false;
+    s_pathState = PATH_STATE_FINISHED;
+
+    if (s_manualPlan)
+    {
+        s_manualPlan = false;
+        s_missionState = MISSION_STATE_IDLE;
+        return;
+    }
+
+    Mission_ApplyPendingPoseLocked();
+    predictedMatches = s_predictionValid &&
+                       PathPlanner_StatesEquivalentForPlanning(&s_plannerState, &s_predictedState);
+    if (!predictedMatches)
+    {
+        s_jobMode = PLANNER_JOB_MODE_NONE;
+        s_queuedPlanValid = false;
+        s_predictionValid = false;
+        Mission_TryBeginPlanningLocked();
+        return;
+    }
+    if (s_predictionComplete)
+    {
+        Mission_SetFinishedLocked();
+        return;
+    }
+    if (s_queuedPlanValid)
+    {
+        Planner_InstallPlanLocked(&s_queuedPlan, false);
+        return;
+    }
+    if (s_jobMode == PLANNER_JOB_MODE_PREDICTED)
+    {
+        s_jobMode = PLANNER_JOB_MODE_CURRENT;
+        s_missionState = MISSION_STATE_PLANNING;
+        s_pathState = PATH_STATE_IDLE;
+        return;
+    }
+    Mission_TryBeginPlanningLocked();
+}
+
+static void PathPlanner_UpdateMotionLocked(void)
+{
+    int32_t finishThreshold;
+    if (!s_motionActive)
+    {
+        return;
+    }
+    s_motionTravelledCounts = Chassis_GetAverageAbsEncoderCounts();
+    finishThreshold = s_motionTargetCounts - APP_PATH_FINISH_TOLERANCE_COUNTS;
+    if (finishThreshold < 0)
+    {
+        finishThreshold = 0;
+    }
+    if (s_motionTravelledCounts < finishThreshold)
+    {
+        PathPlanner_ApplyMotionVelocityLocked();
+        return;
+    }
+
+    Chassis_Stop();
+    s_motionActive = false;
+    s_plannerState = s_stepExpectedState;
+    s_heading = PathPlanner_PlannerDirToPathDir(s_plannerState.car_dir);
+    Mission_UpdateRecognitionPositionsLocked();
+    (void)planner_state_remove_completed_pairs(&s_plannerState);
+    s_activeStepIndex++;
+    if (s_activeStepIndex >= (uint16_t)s_activePlan.step_count)
+    {
+        Mission_FinishActivePlanLocked();
+    }
+}
+
+static bool Mission_SendRecognitionRequestLocked(void)
+{
+    uint16_t sequence = Mission_NextSequence();
+    if (!Vision_RequestRecognition(sequence, s_currentRecognitionPoint))
+    {
+        Mission_SetErrorLocked();
+        return false;
+    }
     s_missionState = MISSION_STATE_WAIT_RECOGNITION;
     s_missionStateTick = xTaskGetTickCount();
     return true;
 }
 
-/* 识别任务状态机，由 PathPlanner_Update() 每20ms推进一次。 */
-static void Mission_Update(void)
+static bool PathPlanner_StartScanLocked(const PlannerStep *step)
 {
+    PlannerObject *object = PathPlanner_FindObjectByIdLocked(step->object_id);
+    int dir = s_plannerState.car_dir;
+    int expectedX;
+    int expectedY;
     recognition_point_t *point;
 
+    if (object == 0 || object->x != step->x || object->y != step->y ||
+        dir < PLANNER_DIR_UP || dir > PLANNER_DIR_LEFT)
+    {
+        return false;
+    }
+    expectedX = s_plannerState.car_x + s_plannerDx[dir];
+    expectedY = s_plannerState.car_y + s_plannerDy[dir];
+    if (expectedX != object->x || expectedY != object->y ||
+        step->object_id < 0 || step->object_id >= s_recognitionPointCount)
+    {
+        return false;
+    }
+
+    s_currentRecognitionPoint = (uint16_t)step->object_id;
+    point = &s_recognitionPoints[s_currentRecognitionPoint];
+    point->observeX = (uint8_t)s_plannerState.car_x;
+    point->observeY = (uint8_t)s_plannerState.car_y;
+    point->observeDir = PathPlanner_PlannerDirToPathDir(dir);
+    s_activeStepIndex++;
+    Chassis_Stop();
+    s_missionState = MISSION_STATE_WAIT_STOP;
+    s_missionStateTick = xTaskGetTickCount();
+    return true;
+}
+
+static void PathPlanner_StartCurrentStepLocked(void)
+{
+    const PlannerStep *step;
+    path_dir_t targetHeading;
+    if (!s_activePlanValid || s_motionActive)
+    {
+        return;
+    }
+    if (s_activeStepIndex >= (uint16_t)s_activePlan.step_count)
+    {
+        Mission_FinishActivePlanLocked();
+        return;
+    }
+
+    step = &s_activePlan.steps[s_activeStepIndex];
+    if (step->type == PLANNER_STEP_SCAN)
+    {
+        targetHeading = PathPlanner_PlannerDirToPathDir(s_plannerState.car_dir);
+        if (s_heading != targetHeading)
+        {
+            PathPlanner_StartRotationLocked(targetHeading);
+            return;
+        }
+        if (!PathPlanner_StartScanLocked(step))
+        {
+            s_activePlanValid = false;
+            Mission_TryBeginPlanningLocked();
+        }
+        return;
+    }
+    if ((step->type != PLANNER_STEP_MOVE && step->type != PLANNER_STEP_PUSH) ||
+        step->dir < PLANNER_DIR_UP || step->dir > PLANNER_DIR_LEFT)
+    {
+        Mission_SetErrorLocked();
+        return;
+    }
+
+    targetHeading = PathPlanner_PlannerDirToPathDir(step->dir);
+    if (s_heading != targetHeading)
+    {
+        PathPlanner_StartRotationLocked(targetHeading);
+        return;
+    }
+    if (!PathPlanner_StartMoveLocked(step))
+    {
+        s_activePlanValid = false;
+        Mission_TryBeginPlanningLocked();
+        return;
+    }
+    if (!s_motionActive && s_activeStepIndex >= (uint16_t)s_activePlan.step_count)
+    {
+        Mission_FinishActivePlanLocked();
+    }
+}
+
+static void Mission_UpdateLocked(void)
+{
     switch (s_missionState)
     {
         case MISSION_STATE_WAIT_MAP:
-            if ((xTaskGetTickCount() - s_missionStateTick) >= pdMS_TO_TICKS(APP_MISSION_MAP_TIMEOUT_MS))
+            if ((xTaskGetTickCount() - s_missionStateTick) >=
+                pdMS_TO_TICKS(APP_MISSION_MAP_TIMEOUT_MS))
             {
                 s_missionRetryCount++;
                 if (!Vision_RequestMap(Mission_NextSequence()))
                 {
-                    s_missionState = MISSION_STATE_ERROR;
+                    Mission_SetErrorLocked();
+                    break;
                 }
                 s_missionStateTick = xTaskGetTickCount();
             }
             break;
 
-        case MISSION_STATE_SELECT_POINT:
-            if (s_recognizedCount >= s_recognitionPointCount)
-            {
-                Chassis_Stop();
-                s_missionState = MISSION_STATE_READY_FOR_PUSH;
-                break;
-            }
-            if (!Mission_SelectNextObservation())
-            {
-                s_missionState = MISSION_STATE_ERROR;
-                break;
-            }
-            point = &s_recognitionPoints[s_currentRecognitionPoint];
-            if (!PathPlanner_Goto(point->observeX, point->observeY))
-            {
-                s_missionState = MISSION_STATE_ERROR;
-                break;
-            }
-            s_missionState = MISSION_STATE_MOVING_TO_OBSERVE;
+        case MISSION_STATE_EXECUTING:
+            PathPlanner_StartCurrentStepLocked();
             break;
 
-        case MISSION_STATE_MOVING_TO_OBSERVE:
-            if (s_pathState == PATH_STATE_ERROR)
-            {
-                s_missionState = MISSION_STATE_ERROR;
-            }
-            else if (s_pathState == PATH_STATE_FINISHED)
-            {
-                Chassis_Stop();
-                s_missionState = MISSION_STATE_WAIT_STOP;
-                s_missionStateTick = xTaskGetTickCount();
-            }
+        case MISSION_STATE_ROTATING:
+            PathPlanner_UpdateRotationLocked();
             break;
 
         case MISSION_STATE_WAIT_STOP:
-            if ((xTaskGetTickCount() - s_missionStateTick) >= pdMS_TO_TICKS(APP_MISSION_STOP_SETTLE_MS))
+            if ((xTaskGetTickCount() - s_missionStateTick) >=
+                pdMS_TO_TICKS(APP_MISSION_STOP_SETTLE_MS))
             {
-                point = &s_recognitionPoints[s_currentRecognitionPoint];
-                if (s_heading == point->observeDir)
-                {
-                    (void)Mission_SendRecognitionRequest();
-                }
-                else
-                {
-                    Mission_StartRotation(point->observeDir);
-                    s_missionState = MISSION_STATE_ROTATE_TO_OBJECT;
-                }
-            }
-            break;
-
-        case MISSION_STATE_ROTATE_TO_OBJECT:
-            if (Mission_UpdateRotation())
-            {
-                (void)Mission_SendRecognitionRequest();
+                (void)Mission_SendRecognitionRequestLocked();
             }
             break;
 
@@ -768,606 +838,457 @@ static void Mission_Update(void)
             break;
 
         case MISSION_STATE_RETRY_RECOGNITION:
-            (void)Mission_SendRecognitionRequest();
-            break;
-
-        case MISSION_STATE_ROTATE_TO_DEFAULT:
-            if (Mission_UpdateRotation())
-            {
-                s_missionState = MISSION_STATE_SELECT_POINT;
-            }
+            (void)Mission_SendRecognitionRequestLocked();
             break;
 
         default:
             break;
     }
 }
-/* 初始化路径规划模块状态。 */
+
 void PathPlanner_Init(void)
 {
-    /*
-     * 对工作区首尾执行一次真实访问，防止链接器将整个专用RAM段删除。
-     * 不需要清空全部700KB，否则会增加启动时间。
-     */
-    ((volatile uint8_t *)s_pathPlannerWorkspace)[0] = 0U;
-    ((volatile uint8_t *)s_pathPlannerWorkspace)
-        [APP_PATH_PLANNER_RAM_SIZE - 1U] = 0U;
-
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    s_stateMutex = xSemaphoreCreateMutex();
+    planner_state_clear(&s_plannerState);
+    memset(&s_predictedState, 0, sizeof(s_predictedState));
+    memset(&s_stepExpectedState, 0, sizeof(s_stepExpectedState));
     s_pathState = PATH_STATE_IDLE;
-    s_mapWidth = 0U;
-    s_mapHeight = 0U;
-    s_mapReady = false;
-    s_poseReady = false;
-    s_poseX = 0U;
-    s_poseY = 0U;
-    s_heading = PATH_DIR_X_POS;
-    s_cellSizeMm = APP_PATH_CELL_SIZE_MM;
-    PathPlanner_ClearSteps();
     s_missionState = MISSION_STATE_IDLE;
-    s_recognitionPointCount = 0U;
-    s_recognizedCount = 0U;
-    s_currentRecognitionPoint = 0U;
-    s_missionRequestSequence = 0U;
-    s_missionRetryCount = 0U;
-    s_missionStateTick = xTaskGetTickCount();
-    s_missionDefaultHeading = PATH_DIR_X_POS;
+    s_cellSizeMm = APP_PATH_CELL_SIZE_MM;
+    s_heading = PATH_DIR_X_POS;
     s_rotationTargetHeading = PATH_DIR_X_POS;
     s_rotationTargetYawCentiDeg = 0;
     s_rotationStableCount = 0U;
+    s_missionStateTick = xTaskGetTickCount();
+    s_missionRequestSequence = 0U;
+    s_missionRetryCount = 0U;
+    s_missionMapAccepted = false;
+    s_pendingPoseValid = false;
+    Mission_ClearRecognitionLocked();
+    PathPlanner_ClearRuntimeLocked();
+    if (s_stateMutex == 0)
+    {
+        s_pathState = PATH_STATE_ERROR;
+        s_missionState = MISSION_STATE_ERROR;
+    }
 }
 
-/* 启动当前已经生成好的路径段队列。 */
 void PathPlanner_Start(void)
 {
-    if ((s_stepCount == 0U) || !s_poseReady)
+    if (!PathPlanner_Lock())
     {
-        s_pathState = PATH_STATE_ERROR;
         return;
     }
-
-    s_stepIndex = 0U;
-    s_segmentActive = false;
-    s_pathState = PATH_STATE_RUNNING;
+    if (s_activePlanValid)
+    {
+        s_pathState = PATH_STATE_RUNNING;
+        s_missionState = MISSION_STATE_EXECUTING;
+    }
+    else
+    {
+        s_pathState = PATH_STATE_ERROR;
+    }
+    PathPlanner_Unlock();
 }
 
-/* 停止路径规划，并立刻停止底盘。 */
 void PathPlanner_Stop(void)
 {
-    Chassis_Stop();
-    PathPlanner_ClearSteps();
+    if (!PathPlanner_Lock())
+    {
+        return;
+    }
+    PathPlanner_ClearRuntimeLocked();
     s_pathState = PATH_STATE_IDLE;
-    if ((s_missionState != MISSION_STATE_IDLE) &&
-        (s_missionState != MISSION_STATE_READY_FOR_PUSH) &&
-        (s_missionState != MISSION_STATE_ERROR))
-    {
-        s_missionState = MISSION_STATE_STOPPED;
-    }
+    s_missionState = MISSION_STATE_STOPPED;
+    PathPlanner_Unlock();
 }
 
-/*
- * 路径规划周期任务的核心函数。
- * 运行逻辑：
- * 1. 如果还没启动当前段，就启动下一段。
- * 2. 如果正在执行，就读取编码器平均计数。
- * 3. 达到目标计数后停止当前段并更新地图坐标。
- * 4. 没走够时继续刷新底盘速度和 yaw 修正。
- */
-static void PathPlanner_UpdateMotion(void)
-{
-    int32_t finishThreshold;
-
-    if (s_pathState != PATH_STATE_RUNNING)
-    {
-        return;
-    }
-
-    if (!s_segmentActive)
-    {
-        (void)PathPlanner_StartNextSegment();
-        return;
-    }
-
-    s_segmentTravelledCounts = Chassis_GetAverageAbsEncoderCounts();
-    finishThreshold = s_segmentTargetCounts - APP_PATH_FINISH_TOLERANCE_COUNTS;
-    if (finishThreshold < 0)
-    {
-        finishThreshold = 0;
-    }
-
-    if (s_segmentTravelledCounts >= finishThreshold)
-    {
-        Chassis_Stop();
-        PathPlanner_ApplyFinishedStep(&s_steps[s_stepIndex]);
-        s_stepIndex++;
-        s_segmentActive = false;
-
-        if (s_stepIndex >= s_stepCount)
-        {
-            s_pathState = PATH_STATE_FINISHED;
-        }
-        return;
-    }
-
-    PathPlanner_UpdateSegmentVelocity();
-}
-
-/* 先推进底盘路径，再推进依赖路径结果的巡检识别状态机。 */
 void PathPlanner_Update(void)
 {
-    PathPlanner_UpdateMotion();
-    Mission_Update();
-}
-/* 获取当前路径规划状态。 */
-path_state_t PathPlanner_GetState(void)
-{
-    return s_pathState;
-}
-
-/* 设置单个地图格子的实际边长，单位 mm。 */
-void PathPlanner_SetCellSizeMm(uint16_t cellSizeMm)
-{
-    if (cellSizeMm == 0U)
+    if (!PathPlanner_Lock())
     {
         return;
     }
-
-    s_cellSizeMm = cellSizeMm;
+    PathPlanner_UpdateMotionLocked();
+    Mission_UpdateLocked();
+    Planner_UpdateJobLocked();
+    PathPlanner_Unlock();
 }
 
-/* 获取当前地图格子边长，单位 mm。 */
+path_state_t PathPlanner_GetState(void)
+{
+    path_state_t result = PATH_STATE_ERROR;
+    if (PathPlanner_Lock())
+    {
+        result = s_pathState;
+        PathPlanner_Unlock();
+    }
+    return result;
+}
+
+void PathPlanner_SetCellSizeMm(uint16_t cellSizeMm)
+{
+    if (cellSizeMm == 0U || !PathPlanner_Lock())
+    {
+        return;
+    }
+    s_cellSizeMm = cellSizeMm;
+    PathPlanner_Unlock();
+}
+
 uint16_t PathPlanner_GetCellSizeMm(void)
 {
-    return s_cellSizeMm;
+    uint16_t result = 0U;
+    if (PathPlanner_Lock())
+    {
+        result = s_cellSizeMm;
+        PathPlanner_Unlock();
+    }
+    return result;
 }
 
-/* 从连续字符数组加载地图，cells 长度至少为 width * height。 */
+bool PathPlanner_IsMapCellValid(char cell)
+{
+    return (cell == PATH_MAP_CELL_WALL) || (cell == PATH_MAP_CELL_EMPTY) ||
+           (cell == PATH_MAP_CELL_GOAL) || (cell == PATH_MAP_CELL_BOMB) ||
+           (cell == PATH_MAP_CELL_BOX);
+}
+
+bool PathPlanner_IsMapCellPassableChar(char cell)
+{
+    return (cell == PATH_MAP_CELL_EMPTY) || (cell == PATH_MAP_CELL_GOAL);
+}
+
+static bool PathPlanner_SetMapLocked(uint8_t width, uint8_t height, const char *cells)
+{
+    bool result;
+    if (s_activePlanValid || s_motionActive || s_jobMode != PLANNER_JOB_MODE_NONE)
+    {
+        return false;
+    }
+    result = planner_state_set_map_rows(&s_plannerState, width, height, cells) != 0;
+    if (!result || !Mission_BuildRecognitionRecordsLocked())
+    {
+        return false;
+    }
+    s_heading = PathPlanner_PlannerDirToPathDir(s_plannerState.car_dir);
+    s_pathState = PATH_STATE_IDLE;
+    s_activePlanValid = false;
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    return true;
+}
+
 bool PathPlanner_SetMap(uint8_t width, uint8_t height, const char *cells)
 {
-    uint8_t x;
-    uint8_t y;
-    char ch;
-
-    if ((cells == 0) || (width == 0U) || (height == 0U) ||
-        (width > APP_MAP_MAX_WIDTH) || (height > APP_MAP_MAX_HEIGHT))
+    bool result;
+    if (cells == 0 || !PathPlanner_Lock())
     {
         return false;
     }
-
-    for (y = 0U; y < height; y++)
-    {
-        for (x = 0U; x < width; x++)
-        {
-            ch = cells[((uint16_t)y * (uint16_t)width) + (uint16_t)x];
-            if (!PathPlanner_IsMapCellValid(ch))
-            {
-                return false;
-            }
-            s_map[y][x] = ch;
-        }
-    }
-
-    s_mapWidth = width;
-    s_mapHeight = height;
-    s_mapReady = true;
-    PathPlanner_ClearSteps();
-    s_pathState = PATH_STATE_IDLE;
-    return true;
+    result = PathPlanner_SetMapLocked(width, height, cells);
+    PathPlanner_Unlock();
+    return result;
 }
 
-/*
- * 从以 / 或 | 分隔的多行文本加载地图。
- * 例如 width=5、height=3 时，可以传入 "#####/#---#/#####"。
- */
 bool PathPlanner_SetMapRows(uint8_t width, uint8_t height, const char *rows)
 {
-    uint8_t x = 0U;
-    uint8_t y = 0U;
-    char ch;
-
-    if ((rows == 0) || (width == 0U) || (height == 0U) ||
-        (width > APP_MAP_MAX_WIDTH) || (height > APP_MAP_MAX_HEIGHT))
+    bool result;
+    if (rows == 0 || !PathPlanner_Lock())
     {
         return false;
     }
-
-    while ((ch = *rows) != '\0')
-    {
-        rows++;
-        if ((ch == '/') || (ch == '|'))
-        {
-            if (x != width)
-            {
-                return false;
-            }
-            x = 0U;
-            y++;
-            if (y >= height)
-            {
-                return false;
-            }
-            continue;
-        }
-
-        if (x >= width)
-        {
-            return false;
-        }
-        if (!PathPlanner_IsMapCellValid(ch))
-        {
-            return false;
-        }
-        s_map[y][x] = ch;
-        x++;
-    }
-
-    if ((y != (uint8_t)(height - 1U)) || (x != width))
-    {
-        return false;
-    }
-
-    s_mapWidth = width;
-    s_mapHeight = height;
-    s_mapReady = true;
-    PathPlanner_ClearSteps();
-    s_pathState = PATH_STATE_IDLE;
-    return true;
+    result = PathPlanner_SetMapLocked(width, height, rows);
+    PathPlanner_Unlock();
+    return result;
 }
 
-/*
- * 设置小车当前地图坐标和朝向。
- * 如果地图已经加载，则起点必须在可通行格子上。
- */
 bool PathPlanner_SetPose(uint8_t x, uint8_t y, path_dir_t heading)
 {
-    if (!PathPlanner_IsValidDir(heading))
+    bool result = false;
+    bool poseChanged;
+    if (!PathPlanner_IsValidDir(heading) || !PathPlanner_Lock())
     {
         return false;
     }
-
-    if (s_mapReady && !PathPlanner_IsPassable(x, y))
+    if (x >= PLANNER_MAX_WIDTH || y >= PLANNER_MAX_HEIGHT ||
+        (PathPlanner_MapReadyLocked() &&
+         (x >= (uint8_t)s_plannerState.width || y >= (uint8_t)s_plannerState.height)))
     {
+        PathPlanner_Unlock();
         return false;
     }
-
-    s_poseX = x;
-    s_poseY = y;
-    s_heading = heading;
-    s_poseReady = true;
-    return true;
+    if (s_activePlanValid || s_motionActive || s_missionState == MISSION_STATE_ROTATING)
+    {
+        s_pendingPoseX = x;
+        s_pendingPoseY = y;
+        s_pendingPoseHeading = heading;
+        s_pendingPoseValid = true;
+        result = true;
+    }
+    else
+    {
+        poseChanged = !s_plannerState.pose_valid ||
+                      s_plannerState.car_x != (int)x ||
+                      s_plannerState.car_y != (int)y ||
+                      s_plannerState.car_dir != PathPlanner_PathDirToPlannerDir(heading);
+        result = Mission_ApplyPoseLocked(x, y, heading);
+        if (result && poseChanged && s_missionState == MISSION_STATE_PLANNING)
+        {
+            Mission_TryBeginPlanningLocked();
+        }
+        else if (result && (s_missionState == MISSION_STATE_WAIT_INPUT ||
+                            s_missionState == MISSION_STATE_WAIT_MAP))
+        {
+            Mission_TryBeginPlanningLocked();
+        }
+    }
+    PathPlanner_Unlock();
+    return result;
 }
 
-/*
- * 直接生成一个“朝某方向走若干格”的路径。
- * 这个接口绕开地图和 BFS，适合单独测试距离执行效果。
- */
-bool PathPlanner_MoveCells(path_dir_t dir, uint8_t cells)
+static bool PathPlanner_GotoLocked(uint8_t targetX, uint8_t targetY)
 {
-    if (!PathPlanner_IsValidDir(dir) || (cells == 0U))
-    {
-        return false;
-    }
-
-    PathPlanner_ClearSteps();
-    s_steps[0].dir = dir;
-    s_steps[0].cells = cells;
-    s_stepCount = 1U;
-    s_poseReady = true;
-    PathPlanner_Start();
-    return true;
-}
-
-/*
- * 用 BFS 从当前位姿规划到目标格。
- * 当前 BFS 只处理普通车辆移动，不处理推箱子的箱子状态。
- */
-bool PathPlanner_Goto(uint8_t targetX, uint8_t targetY)
-{
-    uint16_t cellCount;
-    uint16_t head = 0U;
-    uint16_t tail = 0U;
-    uint16_t startIndex;
-    uint16_t targetIndex;
-    uint16_t currentIndex;
-    uint16_t nextIndex;
-    uint16_t reverseCount = 0U;
-    int16_t parentIndex;
-    int8_t dx[4] = {1, 0, -1, 0};
-    int8_t dy[4] = {0, 1, 0, -1};
-    uint8_t index;
-    uint8_t currentX;
-    uint8_t currentY;
-    uint8_t nextX;
-    uint8_t nextY;
-
-    if (!s_mapReady || !s_poseReady || !PathPlanner_IsPassable(targetX, targetY) ||
-        !PathPlanner_IsPassable(s_poseX, s_poseY))
+    PlannerPlan plan;
+    bool missionIdle = s_missionState == MISSION_STATE_IDLE ||
+                       s_missionState == MISSION_STATE_STOPPED ||
+                       s_missionState == MISSION_STATE_FINISHED;
+    if (!missionIdle || s_activePlanValid || s_motionActive ||
+        s_jobMode != PLANNER_JOB_MODE_NONE ||
+        !PathPlanner_MapReadyLocked() || !s_plannerState.pose_valid ||
+        targetX >= (uint8_t)s_plannerState.width || targetY >= (uint8_t)s_plannerState.height ||
+        !planner_plan_to_pose(
+            &s_plannerState,
+            targetX,
+            targetY,
+            s_plannerState.car_dir,
+            &plan))
     {
         s_pathState = PATH_STATE_ERROR;
         return false;
     }
-
-    startIndex = PathPlanner_ToIndex(s_poseX, s_poseY);
-    targetIndex = PathPlanner_ToIndex(targetX, targetY);
-    if (startIndex == targetIndex)
+    if (plan.step_count == 0)
     {
-        Chassis_Stop();
-        PathPlanner_ClearSteps();
         s_pathState = PATH_STATE_FINISHED;
         return true;
     }
-
-    cellCount = (uint16_t)((uint16_t)s_mapWidth * (uint16_t)s_mapHeight);
-    for (currentIndex = 0U; currentIndex < cellCount; currentIndex++)
-    {
-        s_bfsVisited[currentIndex] = 0U;
-        s_bfsParent[currentIndex] = -1;
-    }
-
-    s_bfsQueue[tail] = startIndex;
-    tail++;
-    s_bfsVisited[startIndex] = 1U;
-
-    while (head < tail)
-    {
-        currentIndex = s_bfsQueue[head];
-        head++;
-        if (currentIndex == targetIndex)
-        {
-            break;
-        }
-
-        currentX = (uint8_t)(currentIndex % s_mapWidth);
-        currentY = (uint8_t)(currentIndex / s_mapWidth);
-        for (index = 0U; index < 4U; index++)
-        {
-            if (((dx[index] < 0) && (currentX == 0U)) || ((dy[index] < 0) && (currentY == 0U)))
-            {
-                continue;
-            }
-
-            nextX = (uint8_t)(currentX + dx[index]);
-            nextY = (uint8_t)(currentY + dy[index]);
-            if (!PathPlanner_IsPassable(nextX, nextY))
-            {
-                continue;
-            }
-
-            nextIndex = PathPlanner_ToIndex(nextX, nextY);
-            if (s_bfsVisited[nextIndex] != 0U)
-            {
-                continue;
-            }
-
-            s_bfsVisited[nextIndex] = 1U;
-            s_bfsParent[nextIndex] = (int16_t)currentIndex;
-            s_bfsQueue[tail] = nextIndex;
-            tail++;
-        }
-    }
-
-    if (s_bfsVisited[targetIndex] == 0U)
-    {
-        s_pathState = PATH_STATE_ERROR;
-        return false;
-    }
-
-    /*
-     * 从目标点沿 parent 反向回溯到起点。
-     * 回溯得到的是反向顺序，所以先存到 s_reverseDirs，后面再倒序加入步骤队列。
-     */
-    currentIndex = targetIndex;
-    while (currentIndex != startIndex)
-    {
-        parentIndex = s_bfsParent[currentIndex];
-        if ((parentIndex < 0) || (reverseCount >= APP_PATH_MAX_STEPS))
-        {
-            s_pathState = PATH_STATE_ERROR;
-            return false;
-        }
-
-        currentX = (uint8_t)(((uint16_t)parentIndex) % s_mapWidth);
-        currentY = (uint8_t)(((uint16_t)parentIndex) / s_mapWidth);
-        nextX = (uint8_t)(currentIndex % s_mapWidth);
-        nextY = (uint8_t)(currentIndex / s_mapWidth);
-        s_reverseDirs[reverseCount] = PathPlanner_GetDirBetween(currentX, currentY, nextX, nextY);
-        reverseCount++;
-        currentIndex = (uint16_t)parentIndex;
-    }
-
-    PathPlanner_ClearSteps();
-    while (reverseCount > 0U)
-    {
-        reverseCount--;
-        if (!PathPlanner_AddStep(s_reverseDirs[reverseCount]))
-        {
-            s_pathState = PATH_STATE_ERROR;
-            return false;
-        }
-    }
-
-    PathPlanner_Start();
-    return true;
+    Planner_InstallPlanLocked(&plan, true);
+    return s_pathState != PATH_STATE_ERROR;
 }
 
-/* 复制当前路径规划状态，供串口 @PATH 返回使用。 */
+bool PathPlanner_Goto(uint8_t targetX, uint8_t targetY)
+{
+    bool result;
+    if (!PathPlanner_Lock())
+    {
+        return false;
+    }
+    result = PathPlanner_GotoLocked(targetX, targetY);
+    PathPlanner_Unlock();
+    return result;
+}
+
+bool PathPlanner_MoveCells(path_dir_t dir, uint8_t cells)
+{
+    int targetX;
+    int targetY;
+    bool result;
+    if (!PathPlanner_IsValidDir(dir) || cells == 0U || !PathPlanner_Lock())
+    {
+        return false;
+    }
+    targetX = s_plannerState.car_x;
+    targetY = s_plannerState.car_y;
+    if (dir == PATH_DIR_X_POS)
+    {
+        targetX += cells;
+    }
+    else if (dir == PATH_DIR_X_NEG)
+    {
+        targetX -= cells;
+    }
+    else if (dir == PATH_DIR_Y_POS)
+    {
+        targetY += cells;
+    }
+    else
+    {
+        targetY -= cells;
+    }
+    result = (targetX >= 0 && targetY >= 0 && targetX < s_plannerState.width &&
+              targetY < s_plannerState.height &&
+              PathPlanner_GotoLocked((uint8_t)targetX, (uint8_t)targetY));
+    PathPlanner_Unlock();
+    return result;
+}
+
 void PathPlanner_GetStatus(path_status_t *status)
 {
-    if (status == 0)
+    if (status == 0 || !PathPlanner_Lock())
     {
         return;
     }
-
     status->state = s_pathState;
-    status->mapReady = s_mapReady;
-    status->poseReady = s_poseReady;
-    status->segmentActive = s_segmentActive;
-    status->x = s_poseX;
-    status->y = s_poseY;
+    status->mapReady = PathPlanner_MapReadyLocked();
+    status->poseReady = s_plannerState.pose_valid != 0U;
+    status->segmentActive = s_motionActive || s_missionState == MISSION_STATE_ROTATING;
+    status->x = (uint8_t)s_plannerState.car_x;
+    status->y = (uint8_t)s_plannerState.car_y;
     status->heading = s_heading;
-    status->stepIndex = s_stepIndex;
-    status->stepCount = s_stepCount;
+    status->stepIndex = s_activeStepIndex;
+    status->stepCount = s_activePlanValid ? (uint16_t)s_activePlan.step_count : 0U;
     status->cellSizeMm = s_cellSizeMm;
-    status->travelledCounts = s_segmentTravelledCounts;
-    status->targetCounts = s_segmentTargetCounts;
+    status->travelledCounts = s_motionTravelledCounts;
+    status->targetCounts = s_motionTargetCounts;
+    PathPlanner_Unlock();
 }
 
-
-/* 启动完整巡检任务：先向视觉串口一请求一次地图。 */
 bool PathPlanner_MissionStart(void)
 {
-    if (!s_poseReady)
+    bool result;
+    if (!PathPlanner_Lock())
     {
-        s_missionState = MISSION_STATE_ERROR;
         return false;
     }
-
-    Chassis_Stop();
-    PathPlanner_ClearSteps();
-    s_pathState = PATH_STATE_IDLE;
-    s_mapReady = false;
-    s_mapWidth = 0U;
-    s_mapHeight = 0U;
-    s_recognitionPointCount = 0U;
-    s_recognizedCount = 0U;
-    s_currentRecognitionPoint = 0U;
+    PathPlanner_ClearRuntimeLocked();
+    planner_state_clear(&s_plannerState);
+    Mission_ClearRecognitionLocked();
+    s_pendingPoseValid = false;
+    s_missionMapAccepted = false;
     s_missionRetryCount = 0U;
     s_missionRequestSequence = 0U;
-    s_missionDefaultHeading = s_heading;
+    s_pathState = PATH_STATE_IDLE;
     s_missionState = MISSION_STATE_WAIT_MAP;
     s_missionStateTick = xTaskGetTickCount();
-
-    if (!Vision_RequestMap(Mission_NextSequence()))
+    result = Vision_RequestMap(Mission_NextSequence());
+    if (!result)
     {
-        s_missionState = MISSION_STATE_ERROR;
-        return false;
+        Mission_SetErrorLocked();
     }
-    return true;
+    PathPlanner_Unlock();
+    return result;
 }
 
 void PathPlanner_MissionStop(void)
 {
-    Chassis_Stop();
-    PathPlanner_ClearSteps();
-    s_pathState = PATH_STATE_IDLE;
-    s_missionState = MISSION_STATE_STOPPED;
+    PathPlanner_Stop();
 }
 
 void PathPlanner_MissionReset(void)
 {
-    Chassis_Stop();
-    PathPlanner_ClearSteps();
-    s_pathState = PATH_STATE_IDLE;
-    s_missionState = MISSION_STATE_IDLE;
-    s_mapReady = false;
-    s_mapWidth = 0U;
-    s_mapHeight = 0U;
-    s_poseReady = false;
-    s_recognitionPointCount = 0U;
-    s_recognizedCount = 0U;
-    s_currentRecognitionPoint = 0U;
+    if (!PathPlanner_Lock())
+    {
+        return;
+    }
+    PathPlanner_ClearRuntimeLocked();
+    planner_state_clear(&s_plannerState);
+    Mission_ClearRecognitionLocked();
+    s_pendingPoseValid = false;
+    s_missionMapAccepted = false;
     s_missionRequestSequence = 0U;
     s_missionRetryCount = 0U;
+    s_pathState = PATH_STATE_IDLE;
+    s_missionState = MISSION_STATE_IDLE;
+    PathPlanner_Unlock();
 }
 
 void PathPlanner_MissionOnMapReceived(uint16_t sequence)
 {
-    if (s_missionState != MISSION_STATE_WAIT_MAP)
+    if (!PathPlanner_Lock())
     {
         return;
     }
-    if ((sequence != 0U) && (sequence != s_missionRequestSequence))
+    if ((s_missionState == MISSION_STATE_WAIT_MAP ||
+         s_missionState == MISSION_STATE_WAIT_INPUT) &&
+        (sequence == 0U || sequence == s_missionRequestSequence) &&
+        PathPlanner_MapReadyLocked())
     {
-        return;
+        s_missionMapAccepted = true;
+        s_missionRetryCount = 0U;
+        Mission_TryBeginPlanningLocked();
     }
-    if (!s_mapReady || !s_poseReady || !PathPlanner_IsPassable(s_poseX, s_poseY) ||
-        !Mission_BuildRecognitionPoints())
-    {
-        s_missionState = MISSION_STATE_ERROR;
-        return;
-    }
-
-    s_missionRetryCount = 0U;
-    s_missionState = (s_recognitionPointCount == 0U) ?
-                         MISSION_STATE_READY_FOR_PUSH : MISSION_STATE_SELECT_POINT;
+    PathPlanner_Unlock();
 }
 
 bool PathPlanner_MissionOnRecognitionResult(uint16_t sequence, uint8_t code)
 {
+    int result;
     recognition_point_t *point;
-
-    if ((s_missionState != MISSION_STATE_WAIT_RECOGNITION) || (code > 20U) ||
-        ((sequence != 0U) && (sequence != s_missionRequestSequence)) ||
-        (s_currentRecognitionPoint >= s_recognitionPointCount))
+    if (!PathPlanner_Lock())
     {
         return false;
     }
+    if (s_missionState != MISSION_STATE_WAIT_RECOGNITION || code > 20U ||
+        (sequence != 0U && sequence != s_missionRequestSequence) ||
+        s_currentRecognitionPoint >= s_recognitionPointCount)
+    {
+        PathPlanner_Unlock();
+        return false;
+    }
 
-    point = &s_recognitionPoints[s_currentRecognitionPoint];
-    if ((code == 20U) ||
-        ((s_map[point->objectY][point->objectX] == PATH_MAP_CELL_BOX) && (code > 9U)) ||
-        ((s_map[point->objectY][point->objectX] == PATH_MAP_CELL_GOAL) && (code < 10U)))
+    result = planner_state_apply_recognition(
+        &s_plannerState,
+        s_currentRecognitionPoint,
+        code);
+    if (result == PLANNER_RECOGNITION_RETRY || result == PLANNER_RECOGNITION_INVALID)
     {
         s_missionRetryCount++;
         s_missionState = MISSION_STATE_RETRY_RECOGNITION;
+        PathPlanner_Unlock();
         return true;
     }
 
+    point = &s_recognitionPoints[s_currentRecognitionPoint];
     point->resultCode = code;
     if (!point->recognized)
     {
         point->recognized = true;
         s_recognizedCount++;
     }
-    s_objectCode[point->objectY][point->objectX] = code;
     s_missionRetryCount = 0U;
-
-    if (s_heading == s_missionDefaultHeading)
-    {
-        s_missionState = MISSION_STATE_SELECT_POINT;
-    }
-    else
-    {
-        Mission_StartRotation(s_missionDefaultHeading);
-        s_missionState = MISSION_STATE_ROTATE_TO_DEFAULT;
-    }
+    s_activePlanValid = false;
+    s_predictionValid = false;
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    Mission_ApplyPendingPoseLocked();
+    Mission_TryBeginPlanningLocked();
+    PathPlanner_Unlock();
     return true;
 }
 
 void PathPlanner_GetMissionStatus(mission_status_t *status)
 {
-    if (status == 0)
+    if (status == 0 || !PathPlanner_Lock())
     {
         return;
     }
-
     status->state = s_missionState;
     status->currentPoint = s_currentRecognitionPoint;
     status->pointCount = s_recognitionPointCount;
     status->recognizedCount = s_recognizedCount;
     status->requestSequence = s_missionRequestSequence;
     status->retryCount = s_missionRetryCount;
-    status->mapReady = s_mapReady;
-    status->poseReady = s_poseReady;
+    status->mapReady = PathPlanner_MapReadyLocked();
+    status->poseReady = s_plannerState.pose_valid != 0U;
+    status->activePlanStep = s_activeStepIndex;
+    status->activePlanSteps = s_activePlanValid ? (uint16_t)s_activePlan.step_count : 0U;
+    status->plannerJobStatus = (uint8_t)s_plannerJobStatus;
+    status->backgroundPlanning = s_jobMode == PLANNER_JOB_MODE_PREDICTED;
+    PathPlanner_Unlock();
 }
 
 bool PathPlanner_GetRecognitionPoint(uint16_t index, recognition_point_t *point)
 {
-    if ((point == 0) || (index >= s_recognitionPointCount))
+    bool result = false;
+    if (point == 0 || !PathPlanner_Lock())
     {
         return false;
     }
-
-    *point = s_recognitionPoints[index];
-    return true;
+    if (index < s_recognitionPointCount)
+    {
+        *point = s_recognitionPoints[index];
+        result = true;
+    }
+    PathPlanner_Unlock();
+    return result;
 }
-uint8_t *PathPlanner_GetWorkspace(void)
-{
-    return s_pathPlannerWorkspace;
-}
-
-uint32_t PathPlanner_GetWorkspaceSize(void)
-{
-    return (uint32_t)sizeof(s_pathPlannerWorkspace);
-}
-
-

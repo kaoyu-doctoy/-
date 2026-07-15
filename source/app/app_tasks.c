@@ -41,7 +41,7 @@ void AppTasks_Create(void)
         (xTaskCreate(ImuTask, "IMU_task", configMINIMAL_STACK_SIZE + 128U, 0, APP_IMU_TASK_PRIORITY, 0) != pdPASS) ||
         (xTaskCreate(VisionTask, "VISION_task", configMINIMAL_STACK_SIZE + 128U, 0,
                      APP_VISION_TASK_PRIORITY, 0) != pdPASS) ||
-        (xTaskCreate(PathTask, "PATH_task", configMINIMAL_STACK_SIZE + 128U, 0, APP_PATH_TASK_PRIORITY, 0) != pdPASS))
+        (xTaskCreate(PathTask, "PATH_task", APP_PATH_TASK_STACK_WORDS, 0, APP_PATH_TASK_PRIORITY, 0) != pdPASS))
     {
         while (1)
         {
@@ -145,5 +145,25 @@ static void PathTask(void *param)
     {
         vTaskDelayUntil(&lastWakeTick, pdMS_TO_TICKS(APP_PATH_PERIOD_MS));
         PathPlanner_Update();
+    }
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *taskName)
+{
+    (void)task;
+    (void)taskName;
+    Chassis_Stop();
+    taskDISABLE_INTERRUPTS();
+    for (;;)
+    {
+    }
+}
+
+void vApplicationMallocFailedHook(void)
+{
+    Chassis_Stop();
+    taskDISABLE_INTERRUPTS();
+    for (;;)
+    {
     }
 }

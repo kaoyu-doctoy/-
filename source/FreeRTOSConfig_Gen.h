@@ -41,7 +41,7 @@
 // #define configAPPLICATION_ALLOCATED_HEAP 0
 // #define configSTACK_ALLOCATION_FROM_SEPARATE_HEAP 0
 // #define configENABLE_HEAP_PROTECTOR 0
-#define configTOTAL_HEAP_SIZE 10240
+#define configTOTAL_HEAP_SIZE (24U * 1024U)
 #define configFRTOS_MEMORY_SCHEME 4
 // #define configSUPPORT_STATIC_ALLOCATION 0
 #define configMINIMAL_SECURE_STACK_SIZE 256
@@ -57,8 +57,8 @@
 #define configMAX_API_CALL_INTERRUPT_PRIORITY (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
 // #define configUSE_IDLE_HOOK 0
 // #define configUSE_TICK_HOOK 0
-// #define configCHECK_FOR_STACK_OVERFLOW 0
-// #define configUSE_MALLOC_FAILED_HOOK 0
+#define configCHECK_FOR_STACK_OVERFLOW 2
+#define configUSE_MALLOC_FAILED_HOOK 1
 // #define configUSE_DAEMON_TASK_STARTUP_HOOK 0
 // #define configUSE_SB_COMPLETED_CALLBACK 0
 // #define configGENERATE_RUN_TIME_STATS 0
