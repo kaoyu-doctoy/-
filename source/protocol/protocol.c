@@ -326,7 +326,7 @@ static void Protocol_PrintPathStatus(void)
 static void Protocol_PrintMissionStatus(void)
 {
     mission_status_t status;
-    int32_t values[12];
+    int32_t values[20];
 
     PathPlanner_GetMissionStatus(&status);
     values[0] = (int32_t)status.state;
@@ -341,9 +341,17 @@ static void Protocol_PrintMissionStatus(void)
     values[9] = (int32_t)status.activePlanSteps;
     values[10] = (int32_t)status.plannerJobStatus;
     values[11] = status.backgroundPlanning ? 1 : 0;
+    values[12] = (int32_t)status.currentLevel;
+    values[13] = (int32_t)status.completedLevels;
+    values[14] = (int32_t)status.initialBoxes;
+    values[15] = (int32_t)status.remainingBoxes;
+    values[16] = status.startAreaKnown ? 1 : 0;
+    values[17] = status.inStartArea ? 1 : 0;
+    values[18] = status.levelSolved ? 1 : 0;
+    values[19] = (int32_t)status.levelElapsedMs;
 
     PRINTF("mission:");
-    Protocol_PrintInt32List(values, 12U);
+    Protocol_PrintInt32List(values, 20U);
     PUTCHAR('\n');
 }
 

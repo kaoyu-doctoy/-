@@ -211,14 +211,13 @@ static bool Vision_HandleYawLine(const char *line)
     return true;
 }
 
-/* 解析带请求序号的 map:seq,w,h,rows，同时兼容旧的 map:w,h,rows。 */
+/* 正式比赛地图帧：map:seq,level,mode,w,h,rows；mode 0=纯推箱，1=标签匹配。 */
 static bool Vision_HandleMapLine(const char *line)
 {
     const char *text;
-    uint16_t firstValue;
-    uint16_t secondValue;
-    uint16_t thirdValue;
-    uint16_t sequence = 0U;
+    uint16_t sequence;
+    uint16_t level;
+    uint16_t mode;
     uint16_t width;
     uint16_t height;
     bool mapOk;
@@ -236,43 +235,70 @@ static bool Vision_HandleMapLine(const char *line)
         return false;
     }
 
-    if (!Vision_ParseUint(&text, &firstValue) || (*text != ','))
+    if (!Vision_ParseUint(&text, &sequence) || (*text != ','))
     {
         (void)Vision_SendMapAck(0U, true);
         return true;
     }
     text++;
-    if (!Vision_ParseUint(&text, &secondValue) || ((*text != ',') && (*text != ':')))
+    if (!Vision_ParseUint(&text, &level) || (*text != ',') ||
+        level == 0U || level > APP_MISSION_LEVEL_COUNT)
     {
-        (void)Vision_SendMapAck(0U, true);
+        (void)Vision_SendMapAck(sequence, true);
         return true;
     }
     text++;
-
-    if (Vision_IsDigit(*text))
+    if (!Vision_ParseUint(&text, &mode) || (*text != ',') || mode > 1U)
     {
-        if (!Vision_ParseUint(&text, &thirdValue) || ((*text != ',') && (*text != ':')))
-        {
-            (void)Vision_SendMapAck(firstValue, true);
-            return true;
-        }
-        text++;
-        sequence = firstValue;
-        width = secondValue;
-        height = thirdValue;
+        (void)Vision_SendMapAck(sequence, true);
+        return true;
     }
-    else
+    text++;
+    if (!Vision_ParseUint(&text, &width) || (*text != ','))
     {
-        width = firstValue;
-        height = secondValue;
+        (void)Vision_SendMapAck(sequence, true);
+        return true;
     }
+    text++;
+    if (!Vision_ParseUint(&text, &height) || ((*text != ',') && (*text != ':')))
+    {
+        (void)Vision_SendMapAck(sequence, true);
+        return true;
+    }
+    text++;
 
     mapOk = PathPlanner_SetMapRows((uint8_t)width, (uint8_t)height, text);
     (void)Vision_SendMapAck(sequence, !mapOk);
     if (mapOk)
     {
-        PathPlanner_MissionOnMapReceived(sequence);
+        PathPlanner_MissionOnMapReceived(sequence, (uint8_t)level, mode == 1U);
     }
+    return true;
+}
+
+/* 发车区观测：zone:1 表示在发车区，zone:0 表示已进入比赛场地。 */
+static bool Vision_HandleZoneLine(const char *line)
+{
+    const char *text;
+    uint16_t inStartArea;
+
+    if (Vision_MatchPrefix(line, "zone:"))
+    {
+        text = line + 5;
+    }
+    else if (Vision_MatchPrefix(line, "zone,"))
+    {
+        text = line + 5;
+    }
+    else
+    {
+        return false;
+    }
+    if (!Vision_ParseUint(&text, &inStartArea) || *text != '\0' || inStartArea > 1U)
+    {
+        return true;
+    }
+    (void)PathPlanner_SetStartArea(inStartArea == 1U);
     return true;
 }
 /* 解析 pose:x,y,heading，用于告诉 MCU 当前车在哪个格子。 */
@@ -450,6 +476,10 @@ static bool Vision_HandleLine(bsp_vision_port_t port, const char *line)
         {
             return true;
         }
+        if (Vision_HandleZoneLine(line))
+        {
+            return true;
+        }
         return Vision_HandleCellLine(line);
     }
 
@@ -556,12 +586,13 @@ static bool Vision_SendText(bsp_vision_port_t port, const char *text)
     return BSP_VisionUartWrite(port, (const uint8_t *)text, length);
 }
 
-bool Vision_RequestMap(uint16_t sequence)
+bool Vision_RequestMap(uint16_t sequence, uint8_t level)
 {
     char frame[APP_VISION_TX_FRAME_MAX_LEN];
     int length;
 
-    length = snprintf(frame, sizeof(frame), "map_req:%u\n", (unsigned int)sequence);
+    length = snprintf(frame, sizeof(frame), "map_req:%u,%u\n",
+                      (unsigned int)sequence, (unsigned int)level);
     return ((length > 0) && ((uint32_t)length < sizeof(frame)) &&
             Vision_SendText(BSP_VISION_PORT_1, frame));
 }

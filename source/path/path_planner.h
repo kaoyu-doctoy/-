@@ -49,14 +49,18 @@ typedef struct
 typedef enum
 {
     MISSION_STATE_IDLE = 0,
+    MISSION_STATE_LEAVING_START,
     MISSION_STATE_WAIT_MAP,
     MISSION_STATE_WAIT_INPUT,
     MISSION_STATE_PLANNING,
     MISSION_STATE_EXECUTING,
     MISSION_STATE_ROTATING,
+    MISSION_STATE_WAIT_POSE,
     MISSION_STATE_WAIT_STOP,
     MISSION_STATE_WAIT_RECOGNITION,
     MISSION_STATE_RETRY_RECOGNITION,
+    MISSION_STATE_ENTERING_START,
+    MISSION_STATE_WAIT_START_SETTLE,
     MISSION_STATE_FINISHED,
     MISSION_STATE_STOPPED,
     MISSION_STATE_ERROR
@@ -87,6 +91,14 @@ typedef struct
     uint16_t activePlanSteps;
     uint8_t plannerJobStatus;
     bool backgroundPlanning;
+    uint8_t currentLevel;
+    uint8_t completedLevels;
+    uint8_t initialBoxes;
+    uint8_t remainingBoxes;
+    bool startAreaKnown;
+    bool inStartArea;
+    bool levelSolved;
+    uint32_t levelElapsedMs;
 } mission_status_t;
 
 void PathPlanner_Init(void);
@@ -111,7 +123,8 @@ void PathPlanner_GetStatus(path_status_t *status);
 bool PathPlanner_MissionStart(void);
 void PathPlanner_MissionStop(void);
 void PathPlanner_MissionReset(void);
-void PathPlanner_MissionOnMapReceived(uint16_t sequence);
+void PathPlanner_MissionOnMapReceived(uint16_t sequence, uint8_t level, bool labeledMode);
+bool PathPlanner_SetStartArea(bool inStartArea);
 bool PathPlanner_MissionOnRecognitionResult(uint16_t sequence, uint8_t code);
 void PathPlanner_GetMissionStatus(mission_status_t *status);
 bool PathPlanner_GetRecognitionPoint(uint16_t index, recognition_point_t *point);

@@ -67,9 +67,6 @@ typedef struct {
 
 typedef struct {
     int parent[PLANNER_MAX_CELLS];
-    int g_cost[PLANNER_MAX_CELLS];
-    int visited[PLANNER_MAX_CELLS];
-    int free_cells[PLANNER_MAX_CELLS];
     int path_cells[PLANNER_MAX_CELLS];
 } FreeMotionScratch;
 
@@ -182,35 +179,8 @@ static int abs_int(int value) {
     return value < 0 ? -value : value;
 }
 
-static int ceil_sqrt_int64(long long value) {
-    long long low = 0;
-    long long high = 1;
-    while (high * high < value) {
-        high <<= 1;
-    }
-    while (low < high) {
-        long long mid = low + (high - low) / 2;
-        if (mid * mid < value) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    return (int)low;
-}
-
 static int manhattan(int x1, int y1, int x2, int y2) {
     return abs_int(x1 - x2) + abs_int(y1 - y2);
-}
-
-static int scaled_distance_cost(int dx_cells, int dy_cells, int per_cell_cost) {
-    long long squared = (long long)dx_cells * (long long)dx_cells +
-                        (long long)dy_cells * (long long)dy_cells;
-    if (squared == 0) {
-        return 0;
-    }
-    squared *= (long long)per_cell_cost * (long long)per_cell_cost;
-    return ceil_sqrt_int64(squared);
 }
 
 static int cell_index(const PlannerContext *ctx, int x, int y) {
@@ -1078,6 +1048,37 @@ static void matching_info_init(MatchingInfo *info) {
     }
 }
 
+static int unique_known_destination(const PlannerInput *input, int box_index) {
+    int matching_box_count = 0;
+    int matching_destination_count = 0;
+    int unique_destination = -1;
+    int destination_index;
+    const PlannerMovableBox *box = &input->movable_boxes[box_index];
+    int other_box_index;
+
+    if (!box->known || box->class_id < 0) {
+        return -1;
+    }
+    for (other_box_index = 0; other_box_index < input->movable_count; ++other_box_index) {
+        const PlannerMovableBox *other_box = &input->movable_boxes[other_box_index];
+        if (other_box->known && other_box->class_id == box->class_id) {
+            matching_box_count += 1;
+        }
+    }
+    for (destination_index = 0; destination_index < input->destination_count; ++destination_index) {
+        const PlannerDestinationBox *destination = &input->destination_boxes[destination_index];
+        if (destination->known && destination->number == box->class_id) {
+            matching_destination_count += 1;
+            unique_destination = destination_index;
+        }
+    }
+    if (matching_box_count == 1 && matching_destination_count == 1 &&
+        !is_forbidden_match(input, box_index, unique_destination)) {
+        return unique_destination;
+    }
+    return -1;
+}
+
 static int build_matching_info(const PlannerInput *input, MatchingInfo *info) {
     uint8_t *unresolved_destination_used = g_workspace.matching.unresolved_destination_used;
     int box_index;
@@ -1088,24 +1089,11 @@ static int build_matching_info(const PlannerInput *input, MatchingInfo *info) {
     memset(unresolved_destination_used, 0, PLANNER_OBJECT_CAPACITY);
 
     for (box_index = 0; box_index < input->movable_count; ++box_index) {
-        const PlannerMovableBox *box = &input->movable_boxes[box_index];
-        if (box->known && box->class_id >= 0) {
-            int fixed_destination_index = -1;
-            for (destination_index = 0; destination_index < input->destination_count; ++destination_index) {
-                const PlannerDestinationBox *destination = &input->destination_boxes[destination_index];
-                if (destination->known && destination->number == box->class_id) {
-                    fixed_destination_index = destination_index;
-                    break;
-                }
-            }
-            if (fixed_destination_index >= 0) {
-                if (is_forbidden_match(input, box_index, fixed_destination_index)) {
-                    return 0;
-                }
-                info->fixed_destination_for_box[box_index] = fixed_destination_index;
-                unresolved_destination_used[fixed_destination_index] = 1;
-                continue;
-            }
+        int fixed_destination = unique_known_destination(input, box_index);
+        if (fixed_destination >= 0) {
+            info->fixed_destination_for_box[box_index] = fixed_destination;
+            unresolved_destination_used[fixed_destination] = 1;
+            continue;
         }
         if (info->unresolved_count >= PLANNER_OBJECT_CAPACITY) {
             return 0;
@@ -1455,98 +1443,6 @@ static void build_motion_block_bits(
     }
 }
 
-static int segment_is_clear_for_motion(
-    const PlannerContext *ctx,
-    int start_cell,
-    int target_cell,
-    const uint8_t blocked[PLANNER_BITSET_BYTES]
-) {
-    int start_x = cell_x(ctx, start_cell);
-    int start_y = cell_y(ctx, start_cell);
-    int target_x = cell_x(ctx, target_cell);
-    int target_y = cell_y(ctx, target_cell);
-    int current_x = start_x;
-    int current_y = start_y;
-    int dx = abs_int(target_x - start_x);
-    int dy = abs_int(target_y - start_y);
-    int step_x = target_x > start_x ? 1 : (target_x < start_x ? -1 : 0);
-    int step_y = target_y > start_y ? 1 : (target_y < start_y ? -1 : 0);
-    int t_delta_x = step_x == 0 ? INT_MAX : 2 * dy;
-    int t_delta_y = step_y == 0 ? INT_MAX : 2 * dx;
-    int t_max_x = step_x == 0 ? INT_MAX : dy;
-    int t_max_y = step_y == 0 ? INT_MAX : dx;
-
-    if (start_cell == target_cell) {
-        return 1;
-    }
-
-    while (current_x != target_x || current_y != target_y) {
-        if (t_max_x < t_max_y) {
-            int sample_cell;
-            current_x += step_x;
-            if (!is_inside(ctx, current_x, current_y)) {
-                return 0;
-            }
-            sample_cell = cell_index(ctx, current_x, current_y);
-            if (sample_cell != start_cell && bitset_get(blocked, sample_cell)) {
-                return 0;
-            }
-            t_max_x += t_delta_x;
-            continue;
-        }
-        if (t_max_y < t_max_x) {
-            int sample_cell;
-            current_y += step_y;
-            if (!is_inside(ctx, current_x, current_y)) {
-                return 0;
-            }
-            sample_cell = cell_index(ctx, current_x, current_y);
-            if (sample_cell != start_cell && bitset_get(blocked, sample_cell)) {
-                return 0;
-            }
-            t_max_y += t_delta_y;
-            continue;
-        }
-
-        if (step_x != 0) {
-            int side_x = current_x + step_x;
-            int side_y = current_y;
-            int sample_cell;
-            if (!is_inside(ctx, side_x, side_y)) {
-                return 0;
-            }
-            sample_cell = cell_index(ctx, side_x, side_y);
-            if (sample_cell != start_cell && bitset_get(blocked, sample_cell)) {
-                return 0;
-            }
-        }
-        if (step_y != 0) {
-            int side_x = current_x;
-            int side_y = current_y + step_y;
-            int sample_cell;
-            if (!is_inside(ctx, side_x, side_y)) {
-                return 0;
-            }
-            sample_cell = cell_index(ctx, side_x, side_y);
-            if (sample_cell != start_cell && bitset_get(blocked, sample_cell)) {
-                return 0;
-            }
-        }
-
-        current_x += step_x;
-        current_y += step_y;
-        if (!is_inside(ctx, current_x, current_y)) {
-            return 0;
-        }
-        if (bitset_get(blocked, cell_index(ctx, current_x, current_y))) {
-            return 0;
-        }
-        t_max_x += t_delta_x;
-        t_max_y += t_delta_y;
-    }
-    return 1;
-}
-
 static int free_motion_plan_bits(
     const PlannerContext *ctx,
     int start_cell,
@@ -1558,13 +1454,11 @@ static int free_motion_plan_bits(
     MovePlan *plan
 ) {
     int *parent = g_workspace.free_motion.parent;
-    int *g_cost = g_workspace.free_motion.g_cost;
-    int *visited = g_workspace.free_motion.visited;
-    int *free_cells = g_workspace.free_motion.free_cells;
     int *path_cells = g_workspace.free_motion.path_cells;
-    int free_count = 0;
+    int *queue = g_workspace.cell_queue;
+    int queue_head = 0;
+    int queue_tail = 0;
     int path_count = 0;
-    int cell_count = ctx->input->width * ctx->input->height;
     int orientation_cost = 0;
     int index;
 
@@ -1596,52 +1490,30 @@ static int free_motion_plan_bits(
     }
 
     int_array_fill(parent, PLANNER_MAX_CELLS, -2);
-    int_array_fill(g_cost, PLANNER_MAX_CELLS, INT_MAX / 4);
-    int_array_fill(visited, PLANNER_MAX_CELLS, 0);
-    for (index = 0; index < cell_count; ++index) {
-        if (!bitset_get(blocked, index) || index == start_cell || index == goal_cell) {
-            free_cells[free_count++] = index;
-        }
-    }
-
     parent[start_cell] = -1;
-    g_cost[start_cell] = 0;
-    while (1) {
-        int current_cell = -1;
-        int best_cost = INT_MAX / 4;
-        for (index = 0; index < free_count; ++index) {
-            int candidate = free_cells[index];
-            if (!visited[candidate] && g_cost[candidate] < best_cost) {
-                best_cost = g_cost[candidate];
-                current_cell = candidate;
-            }
-        }
-        if (current_cell < 0) {
-            break;
-        }
+    queue[queue_tail++] = start_cell;
+    while (queue_head < queue_tail) {
+        int current_cell = queue[queue_head++];
+        int current_x = cell_x(ctx, current_cell);
+        int current_y = cell_y(ctx, current_cell);
+        int dir;
         if (current_cell == goal_cell) {
             break;
         }
-        visited[current_cell] = 1;
-        for (index = 0; index < free_count; ++index) {
-            int next_cell = free_cells[index];
-            int tentative_cost;
-            int dx_cells;
-            int dy_cells;
-            if (next_cell == current_cell || visited[next_cell]) {
+
+        for (dir = 0; dir < 4; ++dir) {
+            int next_x = current_x + DIR_DX[dir];
+            int next_y = current_y + DIR_DY[dir];
+            int next_cell;
+            if (!is_inside(ctx, next_x, next_y)) {
                 continue;
             }
-            if (!segment_is_clear_for_motion(ctx, current_cell, next_cell, blocked)) {
+            next_cell = cell_index(ctx, next_x, next_y);
+            if (parent[next_cell] != -2 || bitset_get(blocked, next_cell)) {
                 continue;
             }
-            dx_cells = abs_int(cell_x(ctx, next_cell) - cell_x(ctx, current_cell));
-            dy_cells = abs_int(cell_y(ctx, next_cell) - cell_y(ctx, current_cell));
-            tentative_cost = g_cost[current_cell] + scaled_distance_cost(dx_cells, dy_cells, MOVE_COST);
-            if (tentative_cost >= g_cost[next_cell]) {
-                continue;
-            }
-            g_cost[next_cell] = tentative_cost;
             parent[next_cell] = current_cell;
+            queue[queue_tail++] = next_cell;
         }
     }
 
@@ -1662,8 +1534,23 @@ static int free_motion_plan_bits(
         path_cells[path_count - 1 - index] = temp;
     }
 
-    for (index = 1; index < path_count; ++index) {
-        int cell = path_cells[index];
+    index = 1;
+    while (index < path_count) {
+        int previous_cell = path_cells[index - 1];
+        int segment_end = index;
+        int step_x = cell_x(ctx, path_cells[index]) - cell_x(ctx, previous_cell);
+        int step_y = cell_y(ctx, path_cells[index]) - cell_y(ctx, previous_cell);
+        int cell;
+        while (segment_end + 1 < path_count) {
+            int current_cell = path_cells[segment_end];
+            int next_cell = path_cells[segment_end + 1];
+            if (cell_x(ctx, next_cell) - cell_x(ctx, current_cell) != step_x ||
+                cell_y(ctx, next_cell) - cell_y(ctx, current_cell) != step_y) {
+                break;
+            }
+            segment_end += 1;
+        }
+        cell = path_cells[segment_end];
         if (!append_step(
                 plan->steps,
                 &plan->step_count,
@@ -1673,10 +1560,11 @@ static int free_motion_plan_bits(
                 goal_dir)) {
             return 0;
         }
+        index = segment_end + 1;
     }
 
     plan->success = 1;
-    plan->cost = g_cost[goal_cell] + orientation_cost;
+    plan->cost = (path_count - 1) * MOVE_COST + orientation_cost;
     return 1;
 }
 
@@ -2376,7 +2264,7 @@ static int estimate_next_task_cost(
             if (destination->number != box->class_id) {
                 continue;
             }
-            estimate = scaled_distance_cost(abs_int(car_x - box->x), abs_int(car_y - box->y), MOVE_COST) +
+            estimate = manhattan(car_x, car_y, box->x, box->y) * MOVE_COST +
                        manhattan(box->x, box->y, destination->x, destination->y) * PUSH_COST +
                        turn_distance(car_dir, PLANNER_DIR_RIGHT) * TURN_COST;
             if (best == 0 || estimate < best) {
@@ -2400,6 +2288,57 @@ static int build_task_candidates(
         const PlannerMovableBox *box = &ctx->input->movable_boxes[box_index];
         int destination_index = certain_destination_for_box(matching_info, box_index);
         const PlannerDestinationBox *destination;
+        if (destination_index < 0 && box->known) {
+            int box_local_index;
+            int best_quick_score = INT_MAX;
+            for (box_local_index = 0;
+                 box_local_index < matching_info->unresolved_count;
+                 ++box_local_index) {
+                if (matching_info->unresolved_box_indices[box_local_index] == box_index) {
+                    int destination_local_index;
+                    for (destination_local_index = 0;
+                         destination_local_index < matching_info->unresolved_count;
+                         ++destination_local_index) {
+                        int candidate_destination_index;
+                        const PlannerDestinationBox *candidate_destination;
+                        int quick_score;
+                        if (!bitset_get(
+                                matching_info->allowed_destinations[box_local_index],
+                                destination_local_index) ||
+                            matching_edge_support(
+                                matching_info,
+                                box_local_index,
+                                destination_local_index) == 0U) {
+                            continue;
+                        }
+                        candidate_destination_index =
+                            matching_info->unresolved_destination_indices[destination_local_index];
+                        candidate_destination =
+                            &ctx->input->destination_boxes[candidate_destination_index];
+                        if (!candidate_destination->known ||
+                            candidate_destination->number != box->class_id) {
+                            continue;
+                        }
+                        quick_score =
+                            manhattan(
+                                ctx->input->car_x,
+                                ctx->input->car_y,
+                                box->x,
+                                box->y) * MOVE_COST +
+                            manhattan(
+                                box->x,
+                                box->y,
+                                candidate_destination->x,
+                                candidate_destination->y) * PUSH_COST;
+                        if (quick_score < best_quick_score) {
+                            best_quick_score = quick_score;
+                            destination_index = candidate_destination_index;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
         if (destination_index < 0) {
             continue;
         }
@@ -2410,10 +2349,7 @@ static int build_task_candidates(
         candidates[candidate_count].box_index = box_index;
         candidates[candidate_count].destination_index = destination_index;
         candidates[candidate_count].quick_score =
-            scaled_distance_cost(
-                abs_int(ctx->input->car_x - box->x),
-                abs_int(ctx->input->car_y - box->y),
-                MOVE_COST) +
+            manhattan(ctx->input->car_x, ctx->input->car_y, box->x, box->y) * MOVE_COST +
             manhattan(box->x, box->y, destination->x, destination->y) * PUSH_COST;
         candidate_count += 1;
     }

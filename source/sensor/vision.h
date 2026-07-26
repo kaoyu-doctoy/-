@@ -24,7 +24,7 @@ uint32_t Vision_GetOverflowCount(bsp_vision_port_t port);
 bool Vision_GetYawCentiDeg(int16_t *yawCentiDeg);
 
 /* 向视觉串口一请求地图，并返回地图接收确认。 */
-bool Vision_RequestMap(uint16_t sequence);
+bool Vision_RequestMap(uint16_t sequence, uint8_t level);
 bool Vision_SendMapAck(uint16_t sequence, bool retry);
 
 /* 向视觉串口二发起识别，并返回识别结果确认。 */

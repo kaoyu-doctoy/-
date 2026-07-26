@@ -63,11 +63,28 @@ static uint16_t s_currentRecognitionPoint;
 static uint16_t s_missionRequestSequence;
 static uint16_t s_missionRetryCount;
 static bool s_missionMapAccepted;
+static uint8_t s_currentLevel;
+static uint8_t s_completedLevels;
+static uint8_t s_initialBoxCount;
+static bool s_startAreaKnown;
+static bool s_inStartArea;
+static bool s_entryPoseValid;
+static uint8_t s_entryX;
+static uint8_t s_entryY;
+static path_dir_t s_entryHeading;
+static bool s_returningToStart;
+static bool s_levelSolved;
+static bool s_levelTimerRunning;
+static TickType_t s_levelStartTick;
+static TickType_t s_nextLevelStartTick;
+static uint32_t s_levelElapsedMs;
 
 static bool s_pendingPoseValid;
 static uint8_t s_pendingPoseX;
 static uint8_t s_pendingPoseY;
 static path_dir_t s_pendingPoseHeading;
+static uint32_t s_poseRevision;
+static uint32_t s_motionStartPoseRevision;
 
 static const int8_t s_plannerDx[4] = {0, 1, 0, -1};
 static const int8_t s_plannerDy[4] = {-1, 0, 1, 0};
@@ -75,6 +92,15 @@ static const int8_t s_plannerDy[4] = {-1, 0, 1, 0};
 static void Mission_TryBeginPlanningLocked(void);
 static void Planner_InstallPlanLocked(const PlannerPlan *plan, bool manualPlan);
 static void Mission_FinishActivePlanLocked(void);
+static void Mission_ConfirmMotionLocked(void);
+static void Mission_BeginReturnLocked(bool solved);
+static void Mission_StartLeavingLocked(void);
+static void Mission_StartEnteringLocked(void);
+static void PathPlanner_ClearRuntimeLocked(void);
+static void Mission_ClearRecognitionLocked(void);
+static void Mission_SetFinishedLocked(void);
+static void PathPlanner_StartRotationLocked(path_dir_t targetHeading);
+static uint32_t Mission_ElapsedMsSince(TickType_t startTick);
 
 static bool PathPlanner_Lock(void)
 {
@@ -347,6 +373,60 @@ static void Mission_SetFinishedLocked(void)
     s_missionState = MISSION_STATE_FINISHED;
 }
 
+static void Mission_BeginReturnLocked(bool solved)
+{
+    PlannerPlan returnPlan;
+    path_dir_t outwardHeading;
+
+    Chassis_Stop();
+    s_motionActive = false;
+    s_activePlanValid = false;
+    s_queuedPlanValid = false;
+    s_predictionValid = false;
+    s_jobMode = PLANNER_JOB_MODE_NONE;
+    if (!s_entryPoseValid || !s_plannerState.pose_valid)
+    {
+        Mission_SetErrorLocked();
+        return;
+    }
+
+    s_levelSolved = solved;
+    s_returningToStart = true;
+    if (solved && s_levelTimerRunning)
+    {
+        s_levelElapsedMs = Mission_ElapsedMsSince(s_levelStartTick);
+        s_levelTimerRunning = false;
+        s_nextLevelStartTick = xTaskGetTickCount();
+    }
+    outwardHeading = (path_dir_t)(((uint32_t)s_entryHeading + 2U) & 3U);
+    if (s_plannerState.car_x == (int)s_entryX &&
+        s_plannerState.car_y == (int)s_entryY &&
+        s_heading == outwardHeading)
+    {
+        Mission_StartEnteringLocked();
+        return;
+    }
+
+    memset(&returnPlan, 0, sizeof(returnPlan));
+    if (!planner_plan_to_pose(
+            &s_plannerState,
+            s_entryX,
+            s_entryY,
+            PathPlanner_PathDirToPlannerDir(outwardHeading),
+            &returnPlan) ||
+        !returnPlan.success)
+    {
+        Mission_SetErrorLocked();
+        return;
+    }
+    if (returnPlan.step_count == 0)
+    {
+        PathPlanner_StartRotationLocked(outwardHeading);
+        return;
+    }
+    Planner_InstallPlanLocked(&returnPlan, true);
+}
+
 static bool Planner_PlanContainsScan(const PlannerPlan *plan)
 {
     int index;
@@ -438,7 +518,7 @@ static void Mission_TryBeginPlanningLocked(void)
     (void)planner_state_remove_completed_pairs(&s_plannerState);
     if (planner_state_is_complete(&s_plannerState))
     {
-        Mission_SetFinishedLocked();
+        Mission_BeginReturnLocked(true);
         return;
     }
 
@@ -451,7 +531,7 @@ static void Mission_TryBeginPlanningLocked(void)
     s_plannerJobStatus = status;
     if (status != PLANNER_JOB_RUNNING)
     {
-        Mission_SetErrorLocked();
+        Mission_BeginReturnLocked(false);
         return;
     }
     s_jobMode = PLANNER_JOB_MODE_CURRENT;
@@ -491,7 +571,7 @@ static void Planner_UpdateJobLocked(void)
     {
         if (completedMode == PLANNER_JOB_MODE_CURRENT)
         {
-            Mission_SetErrorLocked();
+            Mission_BeginReturnLocked(false);
         }
         return;
     }
@@ -540,7 +620,14 @@ static void PathPlanner_UpdateRotationLocked(void)
             s_heading = s_rotationTargetHeading;
             s_plannerState.car_dir = PathPlanner_PathDirToPlannerDir(s_heading);
             s_plannerState.car_yaw_cdeg = s_rotationTargetYawCentiDeg;
-            s_missionState = MISSION_STATE_EXECUTING;
+            if (s_returningToStart && !s_activePlanValid)
+            {
+                Mission_StartEnteringLocked();
+            }
+            else
+            {
+                s_missionState = MISSION_STATE_EXECUTING;
+            }
         }
         return;
     }
@@ -576,7 +663,6 @@ static bool PathPlanner_StartMoveLocked(const PlannerStep *step)
     int32_t dx = (int32_t)step->x - (int32_t)s_plannerState.car_x;
     int32_t dy = (int32_t)step->y - (int32_t)s_plannerState.car_y;
     int32_t maxCells;
-    float norm;
     float distanceM;
 
     s_stepExpectedState = s_plannerState;
@@ -592,13 +678,16 @@ static bool PathPlanner_StartMoveLocked(const PlannerStep *step)
         return true;
     }
 
-    norm = sqrtf(((float)dx * (float)dx) + ((float)dy * (float)dy));
-    if (norm <= 0.0f)
+    if ((dx != 0 && dy != 0) || (dx == 0 && dy == 0))
     {
         return false;
     }
-    s_motionVx = APP_PATH_DRIVE_SPEED_MPS * ((float)dx / norm);
-    s_motionVy = APP_PATH_DRIVE_SPEED_MPS * ((float)dy / norm);
+    /*
+     * Chassis_SetVelocity 使用车体坐标。执行器已经在每段运动前把车头
+     * 转到 step->dir，因此地图上的四方向运动在车体系里恒为正向行驶。
+     */
+    s_motionVx = APP_PATH_DRIVE_SPEED_MPS;
+    s_motionVy = 0.0f;
     maxCells = PathPlanner_MaxInt32(PathPlanner_AbsInt32(dx), PathPlanner_AbsInt32(dy));
     distanceM = ((float)s_cellSizeMm * (float)maxCells) / 1000.0f;
     s_motionTargetCounts = PathPlanner_AbsInt32(Chassis_DistanceMToEncoderCounts(distanceM));
@@ -609,6 +698,7 @@ static bool PathPlanner_StartMoveLocked(const PlannerStep *step)
     s_motionTargetYawCentiDeg = PathPlanner_HeadingToYaw(
         PathPlanner_PlannerDirToPathDir(step->dir));
     s_motionTravelledCounts = 0;
+    s_motionStartPoseRevision = s_poseRevision;
     s_motionActive = true;
     BSP_EncoderClearAll();
     PathPlanner_ApplyMotionVelocityLocked();
@@ -626,6 +716,11 @@ static void Mission_FinishActivePlanLocked(void)
     if (s_manualPlan)
     {
         s_manualPlan = false;
+        if (s_returningToStart)
+        {
+            Mission_StartEnteringLocked();
+            return;
+        }
         s_missionState = MISSION_STATE_IDLE;
         return;
     }
@@ -643,7 +738,7 @@ static void Mission_FinishActivePlanLocked(void)
     }
     if (s_predictionComplete)
     {
-        Mission_SetFinishedLocked();
+        Mission_BeginReturnLocked(true);
         return;
     }
     if (s_queuedPlanValid)
@@ -682,11 +777,131 @@ static void PathPlanner_UpdateMotionLocked(void)
 
     Chassis_Stop();
     s_motionActive = false;
+    s_missionState = MISSION_STATE_WAIT_POSE;
+    s_missionStateTick = xTaskGetTickCount();
+    Mission_ConfirmMotionLocked();
+}
+
+static uint8_t Mission_CountBoxesLocked(void)
+{
+    int index;
+    uint8_t count = 0U;
+    for (index = 0; index < s_plannerState.object_count; index++)
+    {
+        if (s_plannerState.objects[index].kind == PLANNER_OBJECT_BOX)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+static uint32_t Mission_ElapsedMsSince(TickType_t startTick)
+{
+    return (uint32_t)(xTaskGetTickCount() - startTick) * (uint32_t)portTICK_PERIOD_MS;
+}
+
+static void Mission_ApplyTransitVelocityLocked(void)
+{
+    int16_t currentYaw = PathPlanner_GetCurrentYaw();
+    int16_t error = PathPlanner_GetYawError(s_motionTargetYawCentiDeg, currentYaw);
+    float correction = ((float)error / 100.0f) * APP_PATH_YAW_HOLD_KP_RADPS_PER_DEG;
+    correction = PathPlanner_ClampFloat(
+        correction,
+        -APP_PATH_YAW_HOLD_MAX_RADPS,
+        APP_PATH_YAW_HOLD_MAX_RADPS);
+    Chassis_SetVelocity(APP_MISSION_START_TRANSIT_SPEED_MPS, 0.0f, correction);
+}
+
+static void Mission_StartLeavingLocked(void)
+{
+    PathPlanner_ClearRuntimeLocked();
+    planner_state_clear(&s_plannerState);
+    Mission_ClearRecognitionLocked();
+    s_pendingPoseValid = false;
+    s_missionMapAccepted = false;
+    s_initialBoxCount = 0U;
+    s_motionTargetYawCentiDeg = PathPlanner_GetCurrentYaw();
+    s_missionStateTick = xTaskGetTickCount();
+    s_pathState = PATH_STATE_RUNNING;
+    s_missionState = MISSION_STATE_LEAVING_START;
+    Mission_ApplyTransitVelocityLocked();
+}
+
+static void Mission_StartEnteringLocked(void)
+{
+    s_motionTargetYawCentiDeg = PathPlanner_HeadingToYaw(
+        (path_dir_t)(((uint32_t)s_entryHeading + 2U) & 3U));
+    s_missionStateTick = xTaskGetTickCount();
+    s_pathState = PATH_STATE_RUNNING;
+    s_missionState = MISSION_STATE_ENTERING_START;
+    Mission_ApplyTransitVelocityLocked();
+}
+
+static void Mission_AdvanceLevelLocked(void)
+{
+    s_completedLevels = s_currentLevel;
+    if (s_currentLevel >= APP_MISSION_LEVEL_COUNT)
+    {
+        Mission_SetFinishedLocked();
+        return;
+    }
+    s_currentLevel++;
+    s_levelSolved = false;
+    s_returningToStart = false;
+    s_levelStartTick = s_nextLevelStartTick;
+    s_levelElapsedMs = 0U;
+    s_levelTimerRunning = true;
+    Mission_StartLeavingLocked();
+}
+
+static void Mission_ConfirmMotionLocked(void)
+{
+    bool poseMatches;
+    if (s_missionState != MISSION_STATE_WAIT_POSE || !s_pendingPoseValid ||
+        s_poseRevision == s_motionStartPoseRevision)
+    {
+        return;
+    }
+
+    poseMatches =
+        s_pendingPoseX == (uint8_t)s_stepExpectedState.car_x &&
+        s_pendingPoseY == (uint8_t)s_stepExpectedState.car_y &&
+        PathPlanner_PathDirToPlannerDir(s_pendingPoseHeading) == s_stepExpectedState.car_dir;
+    if (!poseMatches)
+    {
+        /*
+         * 编码器只证明轮子转过，不证明车和箱子到达预测格。此时不能提交
+         * 预测世界状态；先采用实测车位，再重新获取包含箱子位置的地图。
+         */
+        (void)Mission_ApplyPoseLocked(
+            s_pendingPoseX,
+            s_pendingPoseY,
+            s_pendingPoseHeading);
+        s_pendingPoseValid = false;
+        s_activePlanValid = false;
+        s_queuedPlanValid = false;
+        s_predictionValid = false;
+        s_jobMode = PLANNER_JOB_MODE_NONE;
+        s_missionMapAccepted = false;
+        s_missionState = MISSION_STATE_WAIT_MAP;
+        s_missionStateTick = xTaskGetTickCount();
+        if (!Vision_RequestMap(Mission_NextSequence(), s_currentLevel))
+        {
+            Mission_SetErrorLocked();
+        }
+        return;
+    }
+
     s_plannerState = s_stepExpectedState;
-    s_heading = PathPlanner_PlannerDirToPathDir(s_plannerState.car_dir);
+    s_heading = s_pendingPoseHeading;
+    s_plannerState.car_dir = PathPlanner_PathDirToPlannerDir(s_heading);
+    s_plannerState.car_yaw_cdeg = PathPlanner_HeadingToYaw(s_heading);
+    s_pendingPoseValid = false;
     Mission_UpdateRecognitionPositionsLocked();
     (void)planner_state_remove_completed_pairs(&s_plannerState);
     s_activeStepIndex++;
+    s_missionState = MISSION_STATE_EXECUTING;
     if (s_activeStepIndex >= (uint16_t)s_activePlan.step_count)
     {
         Mission_FinishActivePlanLocked();
@@ -798,12 +1013,25 @@ static void Mission_UpdateLocked(void)
 {
     switch (s_missionState)
     {
+        case MISSION_STATE_LEAVING_START:
+        case MISSION_STATE_ENTERING_START:
+            if ((xTaskGetTickCount() - s_missionStateTick) >=
+                pdMS_TO_TICKS(APP_MISSION_START_TRANSIT_TIMEOUT_MS))
+            {
+                Mission_SetErrorLocked();
+            }
+            else
+            {
+                Mission_ApplyTransitVelocityLocked();
+            }
+            break;
+
         case MISSION_STATE_WAIT_MAP:
             if ((xTaskGetTickCount() - s_missionStateTick) >=
                 pdMS_TO_TICKS(APP_MISSION_MAP_TIMEOUT_MS))
             {
                 s_missionRetryCount++;
-                if (!Vision_RequestMap(Mission_NextSequence()))
+                if (!Vision_RequestMap(Mission_NextSequence(), s_currentLevel))
                 {
                     Mission_SetErrorLocked();
                     break;
@@ -818,6 +1046,16 @@ static void Mission_UpdateLocked(void)
 
         case MISSION_STATE_ROTATING:
             PathPlanner_UpdateRotationLocked();
+            break;
+
+        case MISSION_STATE_WAIT_POSE:
+            Mission_ConfirmMotionLocked();
+            if (s_missionState == MISSION_STATE_WAIT_POSE &&
+                (xTaskGetTickCount() - s_missionStateTick) >=
+                    pdMS_TO_TICKS(APP_MISSION_POSE_TIMEOUT_MS))
+            {
+                Mission_SetErrorLocked();
+            }
             break;
 
         case MISSION_STATE_WAIT_STOP:
@@ -839,6 +1077,20 @@ static void Mission_UpdateLocked(void)
 
         case MISSION_STATE_RETRY_RECOGNITION:
             (void)Mission_SendRecognitionRequestLocked();
+            break;
+
+        case MISSION_STATE_WAIT_START_SETTLE:
+            if ((xTaskGetTickCount() - s_missionStateTick) >=
+                pdMS_TO_TICKS(APP_MISSION_START_SETTLE_MS))
+            {
+                if (s_levelTimerRunning)
+                {
+                    s_levelElapsedMs = Mission_ElapsedMsSince(s_levelStartTick);
+                    s_levelTimerRunning = false;
+                }
+                s_nextLevelStartTick = xTaskGetTickCount();
+                Mission_AdvanceLevelLocked();
+            }
             break;
 
         default:
@@ -866,6 +1118,20 @@ void PathPlanner_Init(void)
     s_missionRetryCount = 0U;
     s_missionMapAccepted = false;
     s_pendingPoseValid = false;
+    s_poseRevision = 0U;
+    s_motionStartPoseRevision = 0U;
+    s_currentLevel = 0U;
+    s_completedLevels = 0U;
+    s_initialBoxCount = 0U;
+    s_startAreaKnown = false;
+    s_inStartArea = false;
+    s_entryPoseValid = false;
+    s_returningToStart = false;
+    s_levelSolved = false;
+    s_levelTimerRunning = false;
+    s_levelStartTick = 0U;
+    s_nextLevelStartTick = 0U;
+    s_levelElapsedMs = 0U;
     Mission_ClearRecognitionLocked();
     PathPlanner_ClearRuntimeLocked();
     if (s_stateMutex == 0)
@@ -1025,6 +1291,7 @@ bool PathPlanner_SetPose(uint8_t x, uint8_t y, path_dir_t heading)
         s_pendingPoseY = y;
         s_pendingPoseHeading = heading;
         s_pendingPoseValid = true;
+        s_poseRevision++;
         result = true;
     }
     else
@@ -1034,6 +1301,19 @@ bool PathPlanner_SetPose(uint8_t x, uint8_t y, path_dir_t heading)
                       s_plannerState.car_y != (int)y ||
                       s_plannerState.car_dir != PathPlanner_PathDirToPlannerDir(heading);
         result = Mission_ApplyPoseLocked(x, y, heading);
+        if (result)
+        {
+            s_poseRevision++;
+            if (!s_entryPoseValid && !s_inStartArea &&
+                (s_missionState == MISSION_STATE_WAIT_MAP ||
+                 s_missionState == MISSION_STATE_WAIT_INPUT))
+            {
+                s_entryX = x;
+                s_entryY = y;
+                s_entryHeading = heading;
+                s_entryPoseValid = true;
+            }
+        }
         if (result && poseChanged && s_missionState == MISSION_STATE_PLANNING)
         {
             Mission_TryBeginPlanningLocked();
@@ -1146,28 +1426,29 @@ void PathPlanner_GetStatus(path_status_t *status)
 
 bool PathPlanner_MissionStart(void)
 {
-    bool result;
     if (!PathPlanner_Lock())
     {
         return false;
     }
-    PathPlanner_ClearRuntimeLocked();
-    planner_state_clear(&s_plannerState);
-    Mission_ClearRecognitionLocked();
-    s_pendingPoseValid = false;
-    s_missionMapAccepted = false;
+    if (!s_startAreaKnown || !s_inStartArea)
+    {
+        PathPlanner_Unlock();
+        return false;
+    }
     s_missionRetryCount = 0U;
     s_missionRequestSequence = 0U;
-    s_pathState = PATH_STATE_IDLE;
-    s_missionState = MISSION_STATE_WAIT_MAP;
-    s_missionStateTick = xTaskGetTickCount();
-    result = Vision_RequestMap(Mission_NextSequence());
-    if (!result)
-    {
-        Mission_SetErrorLocked();
-    }
+    s_currentLevel = 1U;
+    s_completedLevels = 0U;
+    s_entryPoseValid = false;
+    s_returningToStart = false;
+    s_levelSolved = false;
+    s_levelTimerRunning = false;
+    s_levelElapsedMs = 0U;
+    s_levelStartTick = 0U;
+    s_nextLevelStartTick = 0U;
+    Mission_StartLeavingLocked();
     PathPlanner_Unlock();
-    return result;
+    return true;
 }
 
 void PathPlanner_MissionStop(void)
@@ -1188,27 +1469,101 @@ void PathPlanner_MissionReset(void)
     s_missionMapAccepted = false;
     s_missionRequestSequence = 0U;
     s_missionRetryCount = 0U;
+    s_currentLevel = 0U;
+    s_completedLevels = 0U;
+    s_initialBoxCount = 0U;
+    s_entryPoseValid = false;
+    s_returningToStart = false;
+    s_levelSolved = false;
+    s_levelTimerRunning = false;
+    s_levelElapsedMs = 0U;
+    s_levelStartTick = 0U;
+    s_nextLevelStartTick = 0U;
     s_pathState = PATH_STATE_IDLE;
     s_missionState = MISSION_STATE_IDLE;
     PathPlanner_Unlock();
 }
 
-void PathPlanner_MissionOnMapReceived(uint16_t sequence)
+void PathPlanner_MissionOnMapReceived(uint16_t sequence, uint8_t level, bool labeledMode)
 {
+    int index;
     if (!PathPlanner_Lock())
     {
         return;
     }
     if ((s_missionState == MISSION_STATE_WAIT_MAP ||
          s_missionState == MISSION_STATE_WAIT_INPUT) &&
-        (sequence == 0U || sequence == s_missionRequestSequence) &&
+        sequence == s_missionRequestSequence &&
+        level == s_currentLevel &&
         PathPlanner_MapReadyLocked())
     {
+        if (!labeledMode)
+        {
+            for (index = 0; index < s_plannerState.object_count; index++)
+            {
+                PlannerObject *object = &s_plannerState.objects[index];
+                if (object->kind == PLANNER_OBJECT_BOX ||
+                    object->kind == PLANNER_OBJECT_DESTINATION)
+                {
+                    object->known = 1;
+                    object->label = 0;
+                }
+            }
+        }
+        s_initialBoxCount = Mission_CountBoxesLocked();
         s_missionMapAccepted = true;
         s_missionRetryCount = 0U;
         Mission_TryBeginPlanningLocked();
     }
     PathPlanner_Unlock();
+}
+
+bool PathPlanner_SetStartArea(bool inStartArea)
+{
+    if (!PathPlanner_Lock())
+    {
+        return false;
+    }
+    s_startAreaKnown = true;
+    s_inStartArea = inStartArea;
+
+    if (s_missionState == MISSION_STATE_LEAVING_START && !inStartArea)
+    {
+        Chassis_Stop();
+        if (!s_levelTimerRunning)
+        {
+            s_levelStartTick = xTaskGetTickCount();
+            s_levelTimerRunning = true;
+        }
+        if (s_plannerState.pose_valid && !s_entryPoseValid)
+        {
+            s_entryX = (uint8_t)s_plannerState.car_x;
+            s_entryY = (uint8_t)s_plannerState.car_y;
+            s_entryHeading = s_heading;
+            s_entryPoseValid = true;
+        }
+        s_missionState = MISSION_STATE_WAIT_MAP;
+        s_missionStateTick = xTaskGetTickCount();
+        if (!Vision_RequestMap(Mission_NextSequence(), s_currentLevel))
+        {
+            Mission_SetErrorLocked();
+        }
+    }
+    else if (s_missionState == MISSION_STATE_ENTERING_START && inStartArea)
+    {
+        Chassis_Stop();
+        if (s_levelSolved)
+        {
+            Mission_AdvanceLevelLocked();
+        }
+        else
+        {
+            s_missionState = MISSION_STATE_WAIT_START_SETTLE;
+            s_missionStateTick = xTaskGetTickCount();
+        }
+    }
+    PathPlanner_Unlock();
+    return true;
 }
 
 bool PathPlanner_MissionOnRecognitionResult(uint16_t sequence, uint8_t code)
@@ -1274,6 +1629,15 @@ void PathPlanner_GetMissionStatus(mission_status_t *status)
     status->activePlanSteps = s_activePlanValid ? (uint16_t)s_activePlan.step_count : 0U;
     status->plannerJobStatus = (uint8_t)s_plannerJobStatus;
     status->backgroundPlanning = s_jobMode == PLANNER_JOB_MODE_PREDICTED;
+    status->currentLevel = s_currentLevel;
+    status->completedLevels = s_completedLevels;
+    status->initialBoxes = s_initialBoxCount;
+    status->remainingBoxes = Mission_CountBoxesLocked();
+    status->startAreaKnown = s_startAreaKnown;
+    status->inStartArea = s_inStartArea;
+    status->levelSolved = s_levelSolved;
+    status->levelElapsedMs = s_levelTimerRunning ?
+        Mission_ElapsedMsSince(s_levelStartTick) : s_levelElapsedMs;
     PathPlanner_Unlock();
 }
 
